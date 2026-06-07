@@ -1,0 +1,14 @@
+# Dependências
+node_modules/
+
+# Sessão do WhatsApp (NUNCA suba isso pro GitHub — dá acesso ao seu WhatsApp)
+auth/
+data/
+
+# Logs
+*.log
+npm-debug.log*
+
+# Variáveis de ambiente locais
+.env
+.env.local
