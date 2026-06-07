@@ -1,5 +1,7 @@
 const express = require("express");
 const QRCode = require("qrcode");
+const fs = require("fs");
+const path = require("path");
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -13,74 +15,97 @@ const app = express();
 app.use(express.json());
 
 const PORT = process.env.PORT || 3001;
-// Pasta da sessão. Na Railway, aponte para um Volume persistente (ex: /data/auth)
-// definindo AUTH_DIR — senão o QR precisa ser escaneado a cada restart.
+// Pasta raiz das sessões. Na Railway, aponte para um Volume persistente
+// (ex: /data) definindo AUTH_DIR — senão os QRs precisam ser reescaneados
+// a cada restart. Cada cliente vira uma subpasta dentro daqui.
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 // Token de segurança: se definido, o /send exige Authorization: Bearer <token>.
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
 
-let sock = null;
-let isConnected = false;
-let lastQR = null; // último QR Code (para mostrar na página web)
+// Uma sessão por cliente/número. sessionId -> { sock, isConnected, lastQR }
+const sessions = new Map();
 
-async function connectWhatsApp() {
-  const { state, saveCreds } = await useMultiFileAuthState(AUTH_DIR);
+// Mantém só letras, números, hífen e underscore — evita path traversal.
+function sanitize(id) {
+  return String(id || "").replace(/[^a-zA-Z0-9_-]/g, "");
+}
+
+async function startSession(sessionId) {
+  let session = sessions.get(sessionId);
+  if (session?.sock) return session; // já está rodando
+  if (!session) {
+    session = { sock: null, isConnected: false, lastQR: null };
+    sessions.set(sessionId, session);
+  }
+
+  const authPath = path.join(AUTH_DIR, sessionId);
+  const { state, saveCreds } = await useMultiFileAuthState(authPath);
   const { version } = await fetchLatestBaileysVersion();
 
-  sock = makeWASocket({
+  const sock = makeWASocket({
     version,
     auth: state,
     logger: P({ level: "silent" }),
   });
+  session.sock = sock;
 
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
-      lastQR = qr;
-      // Mostra também no terminal (alguns visualizadores de log renderizam).
-      try {
-        console.log(await QRCode.toString(qr, { type: "terminal", small: true }));
-      } catch {}
-      console.log("\n=== Abra a URL do bot no navegador para escanear o QR Code ===\n");
+      session.lastQR = qr;
+      console.log(`[${sessionId}] QR Code gerado — abra /connect/${sessionId} para escanear`);
     }
 
     if (connection === "close") {
-      isConnected = false;
+      session.isConnected = false;
+      session.sock = null;
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const shouldReconnect = code !== DisconnectReason.loggedOut;
-
-      if (shouldReconnect) {
-        console.log("Conexão caiu, reconectando...");
-        connectWhatsApp();
+      if (code !== DisconnectReason.loggedOut) {
+        console.log(`[${sessionId}] conexão caiu, reconectando...`);
+        startSession(sessionId);
       } else {
-        console.log("Sessão encerrada. Apague a pasta de auth e reinicie para reconectar.");
+        console.log(`[${sessionId}] sessão encerrada (logout). Reescaneie para reconectar.`);
+        sessions.delete(sessionId);
       }
     }
 
     if (connection === "open") {
-      isConnected = true;
-      lastQR = null;
-      console.log("✅ Bot conectado ao WhatsApp com sucesso!");
+      session.isConnected = true;
+      session.lastQR = null;
+      console.log(`[${sessionId}] ✅ conectado ao WhatsApp!`);
     }
   });
+
+  return session;
 }
 
-// Normaliza telefone brasileiro para o JID do WhatsApp.
-// Aceita "11999998888" (11 díg) ou "5511999998888" (já com país) e devolve
-// o JID real consultando o WhatsApp — isso resolve a variação do 9º dígito.
-async function resolveJid(phone) {
+// Ao iniciar, reconecta automaticamente todas as sessões já salvas no disco.
+function restoreSessions() {
+  if (!fs.existsSync(AUTH_DIR)) return;
+  const dirs = fs
+    .readdirSync(AUTH_DIR, { withFileTypes: true })
+    .filter((d) => d.isDirectory())
+    .map((d) => d.name);
+  for (const id of dirs) {
+    console.log(`Restaurando sessão salva: ${id}`);
+    startSession(id);
+  }
+}
+
+// Normaliza telefone brasileiro e resolve o JID real (trata o 9º dígito).
+async function resolveJid(sock, phone) {
   let digits = String(phone).replace(/\D/g, "");
   if (!digits) return null;
-  // Adiciona o código do Brasil (55) quando vier só com DDD + número.
-  if (digits.length <= 11) digits = "55" + digits;
+  if (digits.length <= 11) digits = "55" + digits; // adiciona código do Brasil
   const results = await sock.onWhatsApp(digits);
   const hit = results?.[0];
-  if (!hit?.exists) return null;
-  return hit.jid;
+  return hit?.exists ? hit.jid : null;
 }
 
-// Rota que o sistema chama para enviar mensagem.
+// ── Rotas ────────────────────────────────────────────────────────────────
+
+// Envio de mensagem. Body: { session, phone, message }
 app.post("/send", async (req, res) => {
   if (BOT_TOKEN) {
     const auth = req.headers.authorization || "";
@@ -90,60 +115,74 @@ app.post("/send", async (req, res) => {
     }
   }
 
+  const sessionId = sanitize(req.body.session);
   const { phone, message } = req.body;
-  if (!phone || !message) {
-    return res.status(400).json({ error: "phone e message são obrigatórios" });
+  if (!sessionId || !phone || !message) {
+    return res.status(400).json({ error: "session, phone e message são obrigatórios" });
   }
 
-  if (!isConnected || !sock) {
-    return res.status(503).json({ error: "Bot não conectado ao WhatsApp" });
+  let session = sessions.get(sessionId);
+  if (!session) session = await startSession(sessionId);
+
+  if (!session.isConnected || !session.sock) {
+    return res
+      .status(503)
+      .json({ error: `Sessão "${sessionId}" não conectada. Abra /connect/${sessionId}` });
   }
 
   try {
-    const jid = await resolveJid(phone);
+    const jid = await resolveJid(session.sock, phone);
     if (!jid) {
-      console.log(`Número sem WhatsApp ou inválido: ${phone}`);
+      console.log(`[${sessionId}] número sem WhatsApp ou inválido: ${phone}`);
       return res.status(404).json({ error: "Número não encontrado no WhatsApp" });
     }
-    await sock.sendMessage(jid, { text: message });
-    console.log(`Mensagem enviada para ${jid}`);
+    await session.sock.sendMessage(jid, { text: message });
+    console.log(`[${sessionId}] mensagem enviada para ${jid}`);
     res.json({ ok: true });
   } catch (err) {
-    console.error("Erro ao enviar mensagem:", err.message);
+    console.error(`[${sessionId}] erro ao enviar:`, err.message);
     res.status(500).json({ error: err.message });
   }
 });
 
-// Status do bot (JSON) — útil para monitoramento.
-app.get("/status", (req, res) => {
-  res.json({ connected: isConnected });
+// Status de uma sessão (JSON).
+app.get("/status/:sessionId", (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  const session = sessions.get(sessionId);
+  res.json({ session: sessionId, connected: Boolean(session?.isConnected) });
 });
 
-// Página inicial: mostra o QR Code para conectar, ou avisa que já está conectado.
-app.get("/", async (req, res) => {
-  if (isConnected) {
+// Página para conectar uma sessão (mostra o QR Code).
+app.get("/connect/:sessionId", async (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).send("Sessão inválida");
+
+  let session = sessions.get(sessionId);
+  if (!session?.sock) session = await startSession(sessionId);
+
+  if (session.isConnected) {
     return res.send(
       `<html><body style="font-family:sans-serif;text-align:center;padding:40px">
-       <h2>✅ Bot conectado ao WhatsApp</h2>
+       <h2>✅ "${sessionId}" conectado ao WhatsApp</h2>
        <p>Tudo certo! As mensagens automáticas estão funcionando.</p>
        </body></html>`
     );
   }
-  if (!lastQR) {
+  if (!session.lastQR) {
     return res.send(
       `<html><head><meta http-equiv="refresh" content="3"></head>
        <body style="font-family:sans-serif;text-align:center;padding:40px">
-       <h2>Gerando QR Code...</h2>
+       <h2>Gerando QR Code de "${sessionId}"...</h2>
        <p>Aguarde alguns segundos. A página atualiza sozinha.</p>
        </body></html>`
     );
   }
   try {
-    const dataUrl = await QRCode.toDataURL(lastQR, { width: 300 });
+    const dataUrl = await QRCode.toDataURL(session.lastQR, { width: 300 });
     res.send(
       `<html><head><meta http-equiv="refresh" content="20"></head>
        <body style="font-family:sans-serif;text-align:center;padding:40px">
-       <h2>Escaneie com o WhatsApp</h2>
+       <h2>Conectar "${sessionId}"</h2>
        <p>WhatsApp → Aparelhos conectados → Conectar um aparelho</p>
        <img src="${dataUrl}" alt="QR Code" />
        <p style="color:#888">A página atualiza sozinha quando conectar.</p>
@@ -154,7 +193,28 @@ app.get("/", async (req, res) => {
   }
 });
 
+// Página inicial: lista as sessões e o estado de cada uma.
+app.get("/", (req, res) => {
+  const rows = [...sessions.entries()]
+    .map(
+      ([id, s]) =>
+        `<tr><td>${id}</td><td>${s.isConnected ? "✅ conectado" : "⚠️ desconectado"}</td>
+         <td><a href="/connect/${id}">conectar</a></td></tr>`
+    )
+    .join("");
+  res.send(
+    `<html><body style="font-family:sans-serif;padding:40px">
+     <h2>Bot WhatsApp — sessões</h2>
+     <p>Para conectar um cliente novo, abra <code>/connect/ID-DO-CLIENTE</code></p>
+     <table border="1" cellpadding="8" style="border-collapse:collapse">
+       <tr><th>Sessão</th><th>Status</th><th></th></tr>
+       ${rows || '<tr><td colspan="3">Nenhuma sessão ativa</td></tr>'}
+     </table>
+     </body></html>`
+  );
+});
+
 app.listen(PORT, () => {
   console.log(`Bot rodando na porta ${PORT}`);
-  connectWhatsApp();
+  restoreSessions();
 });
