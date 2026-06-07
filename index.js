@@ -21,13 +21,34 @@ const PORT = process.env.PORT || 3001;
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 // Token de segurança: se definido, o /send exige Authorization: Bearer <token>.
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
+// Tempo mínimo (minutos) entre auto-respostas para o MESMO contato, para não
+// responder toda mensagem numa conversa. 0 = responde sempre. Padrão: 6h.
+const COOLDOWN_MIN = Number(process.env.AUTOREPLY_COOLDOWN_MIN ?? 360);
 
 // Uma sessão por cliente/número. sessionId -> { sock, isConnected, lastQR }
 const sessions = new Map();
+// Última auto-resposta por contato: "sessionId:jid" -> timestamp.
+const lastReply = new Map();
 
 // Mantém só letras, números, hífen e underscore — evita path traversal.
 function sanitize(id) {
   return String(id || "").replace(/[^a-zA-Z0-9_-]/g, "");
+}
+
+// Config de auto-resposta por sessão (salva em disco, junto do Volume).
+function configPath(sessionId) {
+  return path.join(AUTH_DIR, `${sessionId}.config.json`);
+}
+function getConfig(sessionId) {
+  try {
+    return JSON.parse(fs.readFileSync(configPath(sessionId), "utf8"));
+  } catch {
+    return { autoReplyEnabled: false, autoReplyMessage: "" };
+  }
+}
+function saveConfig(sessionId, cfg) {
+  fs.mkdirSync(AUTH_DIR, { recursive: true });
+  fs.writeFileSync(configPath(sessionId), JSON.stringify(cfg, null, 2));
 }
 
 async function startSession(sessionId) {
@@ -77,6 +98,39 @@ async function startSession(sessionId) {
     }
   });
 
+  // Auto-resposta: quando um cliente manda mensagem, responde com o link/cardápio.
+  sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    if (type !== "notify") return;
+    const cfg = getConfig(sessionId);
+    if (!cfg.autoReplyEnabled || !cfg.autoReplyMessage) return;
+
+    for (const msg of messages) {
+      const jid = msg.key?.remoteJid || "";
+      if (msg.key?.fromMe) continue; // mensagem minha
+      if (jid.endsWith("@g.us")) continue; // grupo
+      if (jid === "status@broadcast") continue; // status
+      const text =
+        msg.message?.conversation || msg.message?.extendedTextMessage?.text;
+      if (!text) continue; // só responde a mensagem de texto
+
+      // Cooldown: não responde o mesmo contato de novo dentro da janela.
+      const key = `${sessionId}:${jid}`;
+      const now = Date.now();
+      if (COOLDOWN_MIN > 0) {
+        const last = lastReply.get(key) || 0;
+        if (now - last < COOLDOWN_MIN * 60 * 1000) continue;
+      }
+      lastReply.set(key, now);
+
+      try {
+        await sock.sendMessage(jid, { text: cfg.autoReplyMessage });
+        console.log(`[${sessionId}] auto-resposta enviada para ${jid}`);
+      } catch (err) {
+        console.error(`[${sessionId}] erro na auto-resposta:`, err.message);
+      }
+    }
+  });
+
   return session;
 }
 
@@ -105,14 +159,38 @@ async function resolveJid(sock, phone) {
 
 // ── Rotas ────────────────────────────────────────────────────────────────
 
+// Verifica o token (quando BOT_TOKEN está definido). Retorna true se ok.
+function checkToken(req) {
+  if (!BOT_TOKEN) return true;
+  const auth = req.headers.authorization || "";
+  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  return token === BOT_TOKEN;
+}
+
+// Lê a config de auto-resposta de uma sessão.
+app.get("/config/:sessionId", (req, res) => {
+  if (!checkToken(req)) return res.status(401).json({ error: "Não autorizado" });
+  const sessionId = sanitize(req.params.sessionId);
+  res.json(getConfig(sessionId));
+});
+
+// Define a auto-resposta. Body: { autoReplyEnabled, autoReplyMessage }
+app.post("/config/:sessionId", (req, res) => {
+  if (!checkToken(req)) return res.status(401).json({ error: "Não autorizado" });
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: "Sessão inválida" });
+  const cfg = {
+    autoReplyEnabled: Boolean(req.body.autoReplyEnabled),
+    autoReplyMessage: String(req.body.autoReplyMessage || ""),
+  };
+  saveConfig(sessionId, cfg);
+  res.json({ ok: true, config: cfg });
+});
+
 // Envio de mensagem. Body: { session, phone, message }
 app.post("/send", async (req, res) => {
-  if (BOT_TOKEN) {
-    const auth = req.headers.authorization || "";
-    const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-    if (token !== BOT_TOKEN) {
-      return res.status(401).json({ error: "Não autorizado" });
-    }
+  if (!checkToken(req)) {
+    return res.status(401).json({ error: "Não autorizado" });
   }
 
   const sessionId = sanitize(req.body.session);

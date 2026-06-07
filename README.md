@@ -34,6 +34,28 @@ Conectar um cliente: abra `http://localhost:3001/connect/ID-DO-CLIENTE` e escane
 | GET | `/connect/:sessionId` | Página com o QR Code para conectar aquela sessão |
 | GET | `/status/:sessionId` | `{ session, connected }` |
 | POST | `/send` | Envia mensagem. Body: `{ session, phone, message }`. Header: `Authorization: Bearer <BOT_TOKEN>` |
+| GET | `/config/:sessionId` | Lê a config de auto-resposta da sessão |
+| POST | `/config/:sessionId` | Define a auto-resposta. Body: `{ autoReplyEnabled, autoReplyMessage }` |
+
+## Auto-resposta (responder "oi" com o link)
+
+Quando um cliente manda mensagem para o número conectado, o bot pode responder
+automaticamente com uma mensagem fixa (ex: o link do cardápio).
+
+Ative por sessão:
+
+```bash
+curl -X POST https://SEU-BOT/config/ID-DO-CLIENTE \
+  -H "Authorization: Bearer SEU_BOT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"autoReplyEnabled":true,"autoReplyMessage":"Olá! Faça seu pedido: https://site/cardapio"}'
+```
+
+- A config fica salva em disco (no Volume), uma por sessão.
+- Para não responder toda mensagem da mesma conversa, há um intervalo mínimo entre
+  respostas ao mesmo contato: `AUTOREPLY_COOLDOWN_MIN` (minutos, padrão `360` = 6h;
+  use `0` para responder sempre).
+- O bot ignora mensagens próprias, grupos e status.
 
 ## Deploy na Railway
 
