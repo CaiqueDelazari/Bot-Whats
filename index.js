@@ -7,6 +7,8 @@ const {
   useMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  makeCacheableSignalKeyStore,
+  Browsers,
 } = require("@whiskeysockets/baileys");
 const { Boom } = require("@hapi/boom");
 const P = require("pino");
@@ -53,22 +55,51 @@ function saveConfig(sessionId, cfg) {
 
 async function startSession(sessionId) {
   let session = sessions.get(sessionId);
-  if (session?.sock) return session; // já está rodando
+  // Já está rodando OU em pleno processo de subir um socket: não cria outro.
+  // Dois sockets com a mesma credencial = "conflito" pro WhatsApp, que desloga
+  // o aparelho. Esse guard (junto com o teardown no "close") é o que evita o
+  // ciclo de deslogamento.
+  if (session?.sock || session?.connecting) return session;
   if (!session) {
-    session = { sock: null, isConnected: false, lastQR: null };
+    session = { sock: null, isConnected: false, lastQR: null, connecting: false, retries: 0 };
     sessions.set(sessionId, session);
   }
+  session.connecting = true;
 
   const authPath = path.join(AUTH_DIR, sessionId);
-  const { state, saveCreds } = await useMultiFileAuthState(authPath);
-  const { version } = await fetchLatestBaileysVersion();
+  let state, saveCreds, version;
+  try {
+    ({ state, saveCreds } = await useMultiFileAuthState(authPath));
+    ({ version } = await fetchLatestBaileysVersion());
+  } catch (err) {
+    // Falha ao iniciar (ex.: sem rede): libera o guard e tenta de novo depois.
+    session.connecting = false;
+    const delay = Math.min(30000, 2000 * 2 ** (session.retries || 0));
+    session.retries = (session.retries || 0) + 1;
+    console.error(`[${sessionId}] erro ao iniciar (${err.message}), tentando em ${Math.round(delay / 1000)}s...`);
+    setTimeout(() => startSession(sessionId), delay);
+    return session;
+  }
+  const logger = P({ level: "silent" });
 
   const sock = makeWASocket({
     version,
-    auth: state,
-    logger: P({ level: "silent" }),
+    auth: {
+      creds: state.creds,
+      // Cache das chaves de sinal: menos erros de descriptografia e instabilidade.
+      keys: makeCacheableSignalKeyStore(state.keys, logger),
+    },
+    logger,
+    // Identidade de navegador FIXA — o WhatsApp reconhece sempre o mesmo
+    // aparelho a cada reconexão, em vez de tratar como dispositivo novo.
+    browser: Browsers.ubuntu("Chrome"),
+    // Não rouba a presença "online" do celular (evita briga de presença).
+    markOnlineOnConnect: false,
+    keepAliveIntervalMs: 25000,
+    syncFullHistory: false,
   });
   session.sock = sock;
+  session.connecting = false;
 
   sock.ev.on("creds.update", saveCreds);
 
@@ -81,19 +112,30 @@ async function startSession(sessionId) {
     if (connection === "close") {
       session.isConnected = false;
       session.sock = null;
+      // Desliga de vez o socket morto: sem isso, eventos atrasados dele
+      // disparam reconexões paralelas e viram socket duplicado (= logout).
+      try { sock.ev.removeAllListeners(); } catch {}
+      try { sock.end?.(); } catch {}
+
       const code = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      if (code !== DisconnectReason.loggedOut) {
-        console.log(`[${sessionId}] conexão caiu, reconectando...`);
-        startSession(sessionId);
-      } else {
-        console.log(`[${sessionId}] sessão encerrada (logout). Reescaneie para reconectar.`);
+      if (code === DisconnectReason.loggedOut) {
+        console.log(`[${sessionId}] logout de verdade. Limpando credenciais — reescaneie em /connect/${sessionId}`);
         sessions.delete(sessionId);
+        try { fs.rmSync(authPath, { recursive: true, force: true }); } catch {}
+      } else {
+        // Reconexão com backoff exponencial (2s, 4s, 8s… teto 30s) para não
+        // martelar o servidor do WhatsApp numa queda transitória.
+        const delay = Math.min(30000, 2000 * 2 ** (session.retries || 0));
+        session.retries = (session.retries || 0) + 1;
+        console.log(`[${sessionId}] conexão caiu (code=${code}), reconectando em ${Math.round(delay / 1000)}s...`);
+        setTimeout(() => startSession(sessionId), delay);
       }
     }
 
     if (connection === "open") {
       session.isConnected = true;
       session.lastQR = null;
+      session.retries = 0;
       console.log(`[${sessionId}] ✅ conectado ao WhatsApp!`);
     }
   });
