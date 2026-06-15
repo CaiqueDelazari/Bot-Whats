@@ -32,6 +32,38 @@ const sessions = new Map();
 // Última auto-resposta por contato: "sessionId:jid" -> timestamp.
 const lastReply = new Map();
 
+// Buffer de debug em memória (últimas N linhas) — exposto em GET /debug pra
+// diagnosticar à distância sem precisar dos logs do Railway.
+const debugLog = [];
+function dbg(line) {
+  const stamp = new Date().toISOString().slice(11, 19);
+  debugLog.push(`${stamp} ${line}`);
+  if (debugLog.length > 200) debugLog.shift();
+  console.log(line);
+}
+
+// Extrai o texto de uma mensagem, lidando com os vários invólucros do WhatsApp
+// (efêmera, ver-uma-vez, legenda de imagem/vídeo, respostas de botão/lista).
+function extractText(message) {
+  if (!message) return "";
+  const m =
+    message.ephemeralMessage?.message ||
+    message.viewOnceMessage?.message ||
+    message.viewOnceMessageV2?.message ||
+    message.documentWithCaptionMessage?.message ||
+    message;
+  return (
+    m.conversation ||
+    m.extendedTextMessage?.text ||
+    m.imageMessage?.caption ||
+    m.videoMessage?.caption ||
+    m.buttonsResponseMessage?.selectedDisplayText ||
+    m.listResponseMessage?.title ||
+    m.templateButtonReplyMessage?.selectedDisplayText ||
+    ""
+  );
+}
+
 // Mantém só letras, números, hífen e underscore — evita path traversal.
 function sanitize(id) {
   return String(id || "").replace(/[^a-zA-Z0-9_-]/g, "");
@@ -142,33 +174,47 @@ async function startSession(sessionId) {
 
   // Auto-resposta: quando um cliente manda mensagem, responde com o link/cardápio.
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    if (type !== "notify") return;
     const cfg = getConfig(sessionId);
-    if (!cfg.autoReplyEnabled || !cfg.autoReplyMessage) return;
-
     for (const msg of messages) {
       const jid = msg.key?.remoteJid || "";
+      const text = extractText(msg.message);
+      // Log de TUDO que chega — é o que permite diagnosticar via /debug.
+      dbg(
+        `[${sessionId}] upsert type=${type} from=${jid} fromMe=${!!msg.key?.fromMe} ` +
+          `hasMsg=${!!msg.message} keys=${msg.message ? Object.keys(msg.message).join(",") : "-"} ` +
+          `text="${text.slice(0, 40)}"`
+      );
+
+      if (type !== "notify") continue; // histórico/sincronização: não responde
+      if (!cfg.autoReplyEnabled || !cfg.autoReplyMessage) {
+        dbg(`[${sessionId}] skip: auto-resposta desligada`);
+        continue;
+      }
       if (msg.key?.fromMe) continue; // mensagem minha
       if (jid.endsWith("@g.us")) continue; // grupo
       if (jid === "status@broadcast") continue; // status
-      const text =
-        msg.message?.conversation || msg.message?.extendedTextMessage?.text;
-      if (!text) continue; // só responde a mensagem de texto
+      if (!text) {
+        dbg(`[${sessionId}] skip: sem texto (tipo não suportado)`);
+        continue;
+      }
 
       // Cooldown: não responde o mesmo contato de novo dentro da janela.
       const key = `${sessionId}:${jid}`;
       const now = Date.now();
       if (COOLDOWN_MIN > 0) {
         const last = lastReply.get(key) || 0;
-        if (now - last < COOLDOWN_MIN * 60 * 1000) continue;
+        if (now - last < COOLDOWN_MIN * 60 * 1000) {
+          dbg(`[${sessionId}] skip: cooldown ativo para ${jid}`);
+          continue;
+        }
       }
       lastReply.set(key, now);
 
       try {
         await sock.sendMessage(jid, { text: cfg.autoReplyMessage });
-        console.log(`[${sessionId}] auto-resposta enviada para ${jid}`);
+        dbg(`[${sessionId}] ✅ auto-resposta ENVIADA para ${jid}`);
       } catch (err) {
-        console.error(`[${sessionId}] erro na auto-resposta:`, err.message);
+        dbg(`[${sessionId}] ❌ erro na auto-resposta: ${err.message}`);
       }
     }
   });
@@ -263,6 +309,11 @@ app.post("/send", async (req, res) => {
     console.error(`[${sessionId}] erro ao enviar:`, err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Debug: últimas linhas de log em memória (pra diagnosticar à distância).
+app.get("/debug", (req, res) => {
+  res.type("text/plain").send(debugLog.join("\n") || "(sem eventos ainda)");
 });
 
 // Status de uma sessão (JSON).
