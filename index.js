@@ -316,6 +316,30 @@ app.get("/debug", (req, res) => {
   res.type("text/plain").send(debugLog.join("\n") || "(sem eventos ainda)");
 });
 
+// Reset: força re-pareamento. Desloga de verdade, apaga as credenciais
+// quebradas e sobe a sessão limpa pra gerar um QR novo. Usar quando a sessão
+// fica "zumbi" (envia mas não recebe). Redireciona pro QR.
+app.get("/reset/:sessionId", async (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).send("Sessão inválida");
+  const session = sessions.get(sessionId);
+  try { await session?.sock?.logout?.(); } catch {}
+  try { session?.sock?.ev?.removeAllListeners?.(); } catch {}
+  try { session?.sock?.end?.(); } catch {}
+  sessions.delete(sessionId);
+  try { fs.rmSync(path.join(AUTH_DIR, sessionId), { recursive: true, force: true }); } catch {}
+  dbg(`[${sessionId}] RESET manual — credenciais apagadas, gerando QR novo`);
+  startSession(sessionId);
+  res.send(
+    `<html><head><meta http-equiv="refresh" content="3;url=/connect/${sessionId}"></head>
+     <body style="font-family:sans-serif;text-align:center;padding:40px">
+     <h2>Sessão "${sessionId}" resetada 🔄</h2>
+     <p>Indo pro QR Code novo... escaneie com o WhatsApp do Mets.</p>
+     <p><a href="/connect/${sessionId}">Clique aqui se não redirecionar</a></p>
+     </body></html>`
+  );
+});
+
 // Status de uma sessão (JSON).
 app.get("/status/:sessionId", (req, res) => {
   const sessionId = sanitize(req.params.sessionId);
