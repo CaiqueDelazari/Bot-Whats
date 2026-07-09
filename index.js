@@ -245,6 +245,79 @@ async function resolveJid(sock, phone) {
   return hit?.exists ? hit.jid : null;
 }
 
+// ── Pesquisa de satisfação (agendada) ─────────────────────────────────────
+// O site chama /schedule-survey ao criar o pedido; o bot envia a mensagem X
+// minutos depois (padrão 1h30). A fila é gravada no AUTH_DIR (Volume da
+// Railway), então sobrevive a restart/deploy. É por sessão: cada pedido guarda
+// de qual cliente (session) a pesquisa deve sair.
+const SURVEY_DELAY_MIN = Number(process.env.SURVEY_DELAY_MIN || 90); // 1h30
+const SURVEY_MAX_LATE_MS =
+  Number(process.env.SURVEY_MAX_LATE_MIN || 180) * 60 * 1000;
+const SURVEY_FILE = path.join(AUTH_DIR, "surveys.json");
+
+let pendingSurveys = [];        // [{ session, phone, orderId, message, dueAt }]
+const surveyTimers = new Map(); // orderId -> handle do setTimeout
+
+function loadSurveys() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SURVEY_FILE, "utf8"));
+    pendingSurveys = Array.isArray(data) ? data : [];
+  } catch {
+    pendingSurveys = [];
+  }
+}
+
+function saveSurveys() {
+  try {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    fs.writeFileSync(SURVEY_FILE, JSON.stringify(pendingSurveys, null, 2));
+  } catch (err) {
+    console.error("[survey] erro ao salvar:", err.message);
+  }
+}
+
+function removeSurvey(orderId) {
+  pendingSurveys = pendingSurveys.filter((s) => s.orderId !== orderId);
+  saveSurveys();
+  const t = surveyTimers.get(orderId);
+  if (t) { clearTimeout(t); surveyTimers.delete(orderId); }
+}
+
+async function sendSurvey(sv) {
+  let session = sessions.get(sv.session);
+  if (!session) session = await startSession(sv.session);
+  // Sessão ainda não conectada → mantém na fila e tenta de novo em 1 min.
+  if (!session.isConnected || !session.sock) {
+    surveyTimers.set(sv.orderId, setTimeout(() => sendSurvey(sv), 60 * 1000));
+    return;
+  }
+  try {
+    const jid = await resolveJid(session.sock, sv.phone);
+    if (jid) {
+      await session.sock.sendMessage(jid, { text: sv.message });
+      dbg(`[${sv.session}] pesquisa enviada para ${jid} (pedido ${sv.orderId})`);
+    } else {
+      dbg(`[${sv.session}] pesquisa não enviada: ${sv.phone} sem WhatsApp`);
+    }
+  } catch (err) {
+    dbg(`[${sv.session}] erro ao enviar pesquisa: ${err.message}`);
+  } finally {
+    removeSurvey(sv.orderId);
+  }
+}
+
+function scheduleSurvey(sv) {
+  const delay = sv.dueAt - Date.now();
+  if (delay <= 0) {
+    // Passou da hora (bot ficou offline). Envia se não atrasou demais; senão
+    // descarta, pra não mandar pesquisa em hora estranha.
+    if (Date.now() - sv.dueAt > SURVEY_MAX_LATE_MS) removeSurvey(sv.orderId);
+    else sendSurvey(sv);
+    return;
+  }
+  surveyTimers.set(sv.orderId, setTimeout(() => sendSurvey(sv), delay));
+}
+
 // ── Rotas ────────────────────────────────────────────────────────────────
 
 // Verifica o token (quando BOT_TOKEN está definido). Retorna true se ok.
@@ -309,6 +382,38 @@ app.post("/send", async (req, res) => {
     console.error(`[${sessionId}] erro ao enviar:`, err.message);
     res.status(500).json({ error: err.message });
   }
+});
+
+// Agendar pesquisa de satisfação. Body: { session, phone, orderId, message, delayMin? }
+// O site compõe a mensagem (sabe o nome do restaurante) e o bot só segura o
+// tempo e envia. delayMin é opcional (padrão SURVEY_DELAY_MIN = 90 = 1h30).
+app.post("/schedule-survey", (req, res) => {
+  if (!checkToken(req)) return res.status(401).json({ error: "Não autorizado" });
+  const sessionId = sanitize(req.body.session);
+  const { phone, orderId, message } = req.body;
+  const delayMin =
+    Number(req.body.delayMin) > 0 ? Number(req.body.delayMin) : SURVEY_DELAY_MIN;
+  if (!sessionId || !phone || !orderId || !message) {
+    return res
+      .status(400)
+      .json({ error: "session, phone, orderId e message são obrigatórios" });
+  }
+  // Evita agendar o mesmo pedido duas vezes.
+  if (pendingSurveys.some((s) => s.orderId === String(orderId))) {
+    return res.json({ ok: true, already: true });
+  }
+  const sv = {
+    session: sessionId,
+    phone: String(phone),
+    orderId: String(orderId),
+    message: String(message),
+    dueAt: Date.now() + delayMin * 60 * 1000,
+  };
+  pendingSurveys.push(sv);
+  saveSurveys();
+  scheduleSurvey(sv);
+  dbg(`[${sessionId}] pesquisa agendada p/ ${phone} em ${delayMin}min (pedido ${orderId})`);
+  res.json({ ok: true });
 });
 
 // Debug: últimas linhas de log em memória (pra diagnosticar à distância).
@@ -412,4 +517,7 @@ app.get("/", (req, res) => {
 app.listen(PORT, () => {
   console.log(`Bot rodando na porta ${PORT}`);
   restoreSessions();
+  // Recarrega as pesquisas de satisfação pendentes e reprograma os envios.
+  loadSurveys();
+  for (const sv of pendingSurveys) scheduleSurvey(sv);
 });
