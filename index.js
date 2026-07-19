@@ -93,7 +93,7 @@ async function startSession(sessionId) {
   // ciclo de deslogamento.
   if (session?.sock || session?.connecting) return session;
   if (!session) {
-    session = { sock: null, isConnected: false, lastQR: null, connecting: false, retries: 0 };
+    session = { sock: null, isConnected: false, lastQR: null, connecting: false, retries: 0, lastActivity: Date.now(), staleStrikes: 0 };
     sessions.set(sessionId, session);
   }
   session.connecting = true;
@@ -136,6 +136,8 @@ async function startSession(sessionId) {
   sock.ev.on("creds.update", saveCreds);
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
+    // Qualquer evento de conexão conta como "sinal de vida" pro watchdog.
+    session.lastActivity = Date.now();
     if (qr) {
       session.lastQR = qr;
       console.log(`[${sessionId}] QR Code gerado — abra /connect/${sessionId} para escanear`);
@@ -168,12 +170,17 @@ async function startSession(sessionId) {
       session.isConnected = true;
       session.lastQR = null;
       session.retries = 0;
+      session.staleStrikes = 0;
+      session.lastActivity = Date.now();
       console.log(`[${sessionId}] ✅ conectado ao WhatsApp!`);
     }
   });
 
   // Auto-resposta: quando um cliente manda mensagem, responde com o link/cardápio.
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    // Recebeu mensagem = socket vivo. Zera o relógio do watchdog.
+    session.lastActivity = Date.now();
+    session.staleStrikes = 0;
     const cfg = getConfig(sessionId);
     for (const msg of messages) {
       const jid = msg.key?.remoteJid || "";
@@ -232,6 +239,86 @@ function restoreSessions() {
   for (const id of dirs) {
     console.log(`Restaurando sessão salva: ${id}`);
     startSession(id);
+  }
+}
+
+// ── Watchdog anti-sessão-zumbi ─────────────────────────────────────────────
+// Problema: às vezes o socket de uma sessão "morre" em silêncio — o WhatsApp
+// para de entregar mensagens, mas o Baileys nunca dispara o evento "close".
+// A sessão fica isConnected=true, sem receber nem enviar nada ("travou").
+// Solução: se uma sessão passar STALE minutos sem NENHUM evento, fazemos uma
+// sondagem ativa (round-trip real ao servidor). Se ela falhar/expirar, o socket
+// está morto → reiniciamos ele reusando a credencial salva em disco (SEM QR).
+const WATCHDOG_STALE_MS =
+  Number(process.env.WATCHDOG_STALE_MIN || 5) * 60 * 1000;
+const WATCHDOG_CHECK_MS =
+  Number(process.env.WATCHDOG_CHECK_SEC || 60) * 1000;
+const WATCHDOG_PROBE_TIMEOUT_MS =
+  Number(process.env.WATCHDOG_PROBE_TIMEOUT_SEC || 12) * 1000;
+
+// Sondagem de vida: faz um onWhatsApp do próprio número (round-trip ao servidor)
+// com timeout. Resolve = socket vivo; throw/timeout = socket morto.
+async function probeAlive(sock) {
+  const id = sock?.user?.id;
+  if (!id) return false;
+  const num = id.split(":")[0].split("@")[0];
+  try {
+    const res = await Promise.race([
+      sock.onWhatsApp(num),
+      new Promise((_, rej) =>
+        setTimeout(() => rej(new Error("probe timeout")), WATCHDOG_PROBE_TIMEOUT_MS)
+      ),
+    ]);
+    return Array.isArray(res);
+  } catch {
+    return false;
+  }
+}
+
+// Reinicia o socket de uma sessão sem apagar credencial (diferente do /reset).
+function restartSocket(sessionId, session) {
+  const sock = session.sock;
+  try { sock?.ev?.removeAllListeners?.(); } catch {}
+  try { sock?.end?.(); } catch {}
+  session.sock = null;
+  session.isConnected = false;
+  session.connecting = false;
+  startSession(sessionId);
+}
+
+let watchdogRunning = false;
+async function watchdogTick() {
+  if (watchdogRunning) return; // evita sobreposição se uma passada demorar
+  watchdogRunning = true;
+  try {
+    const now = Date.now();
+    for (const [sessionId, session] of sessions.entries()) {
+      // Só vigia sessões que se dizem conectadas e não estão subindo agora.
+      if (!session.isConnected || !session.sock || session.connecting) continue;
+      if (now - (session.lastActivity || 0) < WATCHDOG_STALE_MS) continue;
+
+      const alive = await probeAlive(session.sock);
+      if (alive) {
+        // Estava só ociosa (sem mensagens), mas viva. Zera o relógio.
+        session.lastActivity = Date.now();
+        session.staleStrikes = 0;
+        continue;
+      }
+
+      // Exige 2 falhas seguidas antes de reiniciar, pra não derrubar por uma
+      // sondagem lenta isolada.
+      session.staleStrikes = (session.staleStrikes || 0) + 1;
+      const min = Math.round((now - (session.lastActivity || 0)) / 60000);
+      if (session.staleStrikes < 2) {
+        dbg(`[${sessionId}] watchdog: sem resposta há ${min}min (aviso ${session.staleStrikes}/2)`);
+        continue;
+      }
+      session.staleStrikes = 0;
+      dbg(`[${sessionId}] watchdog: sessão zumbi (${min}min sem responder) — reiniciando socket SEM QR`);
+      restartSocket(sessionId, session);
+    }
+  } finally {
+    watchdogRunning = false;
   }
 }
 
@@ -520,4 +607,9 @@ app.listen(PORT, () => {
   // Recarrega as pesquisas de satisfação pendentes e reprograma os envios.
   loadSurveys();
   for (const sv of pendingSurveys) scheduleSurvey(sv);
+  // Vigia sessões zumbi e reconecta sozinho (sem QR).
+  setInterval(watchdogTick, WATCHDOG_CHECK_MS);
+  console.log(
+    `Watchdog ativo: sonda sessões paradas há >${WATCHDOG_STALE_MS / 60000}min a cada ${WATCHDOG_CHECK_MS / 1000}s`
+  );
 });
