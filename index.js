@@ -168,12 +168,19 @@ async function startSession(sessionId) {
       session.isConnected = true;
       session.lastQR = null;
       session.retries = 0;
+      // Zera o batimento ao conectar: dá a janela cheia do watchdog antes de
+      // considerar a sessão surda (e evita reconexão em loop se seguir surda).
+      session.lastRecv = Date.now();
       console.log(`[${sessionId}] ✅ conectado ao WhatsApp!`);
     }
   });
 
   // Auto-resposta: quando um cliente manda mensagem, responde com o link/cardápio.
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
+    // Batimento do watchdog: marca que ALGO chegou (inclui status@broadcast,
+    // que pinga o tempo todo numa conexão viva). É assim que detectamos a
+    // sessão "surda" — quando isso para de acontecer por muito tempo.
+    session.lastRecv = Date.now();
     const cfg = getConfig(sessionId);
     for (const msg of messages) {
       const jid = msg.key?.remoteJid || "";
@@ -514,10 +521,62 @@ app.get("/", (req, res) => {
   );
 });
 
+// ── Watchdog: recupera sessão "surda/zumbi" sozinho, sem QR ────────────────
+// O pior modo de falha do Baileys: a sessão fica connected:true, ainda ENVIA,
+// mas para de RECEBER — o socket morreu em silêncio e o "close" nunca dispara,
+// então nada reconecta e a loja fica horas sem o bot até alguém perceber.
+//
+// Detectamos pelo tempo desde o último evento RECEBIDO (session.lastRecv). Numa
+// conexão viva os status@broadcast dos contatos chegam o tempo todo, então isso
+// é um batimento confiável — sondas ativas (onWhatsApp) NÃO servem porque
+// passam mesmo com a sessão surda. Passou do limite → derruba e reconecta com a
+// MESMA credencial (sem QR, sem perder conversa).
+//
+// Trava anti-tempestade (reconexões seguidas já deixaram TODAS as sessões
+// surdas uma vez): o lastRecv reseta ao reconectar, então cada sessão só é
+// reconectada, no máximo, uma vez por janela (WATCHDOG_STALE_MIN).
+const WATCHDOG_STALE_MS = Number(process.env.WATCHDOG_STALE_MIN || 15) * 60 * 1000;
+const WATCHDOG_EVERY_MS = Number(process.env.WATCHDOG_EVERY_MIN || 2) * 60 * 1000;
+
+function softReconnect(sessionId, reason) {
+  const session = sessions.get(sessionId);
+  if (!session) return;
+  dbg(`[${sessionId}] watchdog: ${reason} — reconectando sem QR`);
+  const old = session.sock;
+  // Desarma o socket surdo ANTES de recriar: sem removeAllListeners, um "close"
+  // atrasado dele dispararia uma segunda reconexão (socket duplicado = logout).
+  session.sock = null;
+  session.isConnected = false;
+  session.connecting = false;
+  try { old?.ev?.removeAllListeners?.(); } catch {}
+  try { old?.end?.(); } catch {}
+  startSession(sessionId);
+}
+
+function watchdogTick() {
+  const now = Date.now();
+  for (const [sessionId, session] of sessions.entries()) {
+    if (!session.isConnected || !session.sock) continue; // só as "conectadas"
+    const last = session.lastRecv || 0;
+    if (last && now - last > WATCHDOG_STALE_MS) {
+      softReconnect(
+        sessionId,
+        `sem receber nada há ${Math.round((now - last) / 60000)}min (provável sessão surda)`
+      );
+    }
+  }
+}
+
 app.listen(PORT, () => {
   console.log(`Bot rodando na porta ${PORT}`);
   restoreSessions();
   // Recarrega as pesquisas de satisfação pendentes e reprograma os envios.
   loadSurveys();
   for (const sv of pendingSurveys) scheduleSurvey(sv);
+  // Liga o watchdog de sessão surda.
+  setInterval(watchdogTick, WATCHDOG_EVERY_MS);
+  console.log(
+    `Watchdog ativo: checa a cada ${WATCHDOG_EVERY_MS / 60000}min; ` +
+      `reconecta sessão sem receber há +${WATCHDOG_STALE_MS / 60000}min.`
+  );
 });
