@@ -487,6 +487,47 @@ app.get("/reset/:sessionId", async (req, res) => {
   );
 });
 
+// Reconexão NÃO-destrutiva: recria o socket com a MESMA credencial, sem QR e
+// sem perder conversa. É o primeiro socorro pra sessão surda (connected:true
+// mas não recebe) — na maioria das vezes o socket é que morreu em silêncio, e
+// isso resolve. Só se ISSO não resolver é que o caso vira /reset + QR (aí o
+// problema é o pareamento). Sem essa rota, a única saída manual era o /reset,
+// que apaga credencial e obriga a reescanear à toa.
+app.get("/reconnect/:sessionId", (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).send("Sessão inválida");
+  if (!sessions.has(sessionId)) return res.status(404).send("Sessão não existe");
+  softReconnect(sessionId, "reconexão manual pedida via /reconnect");
+  // Zera a escalada: é uma tentativa humana, não conta como strike do watchdog.
+  const session = sessions.get(sessionId);
+  if (session) session.watchdogStrikes = 0;
+  res.type("text/plain").send(
+    `Sessão "${sessionId}" reconectando com a mesma credencial (sem QR).\n` +
+      `Acompanhe em /health e /debug.`
+  );
+});
+
+// Saúde das sessões: mostra há quanto tempo cada uma recebeu ALGO. É o que o
+// /debug não conta — o batimento (markRecv) inclui recibos e presença, que não
+// são logados. "recebeuHaMin" alto numa sessão connected = sessão surda.
+app.get("/health", (req, res) => {
+  const now = Date.now();
+  res.json({
+    watchdog: {
+      janelaMin: WATCHDOG_STALE_MS / 60000,
+      checaCadaMin: WATCHDOG_EVERY_MS / 60000,
+      maxTentativas: WATCHDOG_MAX_STRIKES,
+    },
+    sessoes: [...sessions.entries()].map(([id, s]) => ({
+      id,
+      conectada: Boolean(s.isConnected),
+      recebeuHaMin: s.lastRecv ? Math.round((now - s.lastRecv) / 60000) : null,
+      tentativasWatchdog: s.watchdogStrikes || 0,
+      aguardandoQR: Boolean(s.lastQR),
+    })),
+  });
+});
+
 // Status de uma sessão (JSON).
 app.get("/status/:sessionId", (req, res) => {
   const sessionId = sanitize(req.params.sessionId);
