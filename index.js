@@ -93,7 +93,14 @@ async function startSession(sessionId) {
   // ciclo de deslogamento.
   if (session?.sock || session?.connecting) return session;
   if (!session) {
-    session = { sock: null, isConnected: false, lastQR: null, connecting: false, retries: 0 };
+    session = {
+      sock: null,
+      isConnected: false,
+      lastQR: null,
+      connecting: false,
+      retries: 0,
+      watchdogStrikes: 0, // reconexões seguidas do watchdog que não resolveram
+    };
     sessions.set(sessionId, session);
   }
   session.connecting = true;
@@ -134,6 +141,37 @@ async function startSession(sessionId) {
   session.connecting = false;
 
   sock.ev.on("creds.update", saveCreds);
+
+  // ── Batimento de recebimento (é o que alimenta o watchdog) ───────────────
+  // QUALQUER evento vindo do WhatsApp conta como "a sessão ainda ouve". Antes
+  // só messages.upsert contava, e isso dava falso positivo em série: numa loja
+  // parada não chega mensagem nenhuma por 15min e a sessão saudável levava
+  // reconexão à toa — de novo e de novo, a noite inteira. Recibos de entrega,
+  // presença ("digitando..."), updates de chat e sincronizações chegam MUITO
+  // mais que mensagens, então isso é um batimento honesto.
+  function markRecv() {
+    session.lastRecv = Date.now();
+    session.watchdogStrikes = 0; // ouviu de verdade: zera a escalada
+  }
+  for (const evt of [
+    "messages.update",
+    "messages.reaction",
+    "message-receipt.update",
+    "presence.update",
+    "chats.upsert",
+    "chats.update",
+    "chats.delete",
+    "contacts.upsert",
+    "contacts.update",
+    "groups.update",
+    "group-participants.update",
+    "messaging-history.set",
+    "blocklist.set",
+    "blocklist.update",
+    "call",
+  ]) {
+    sock.ev.on(evt, markRecv);
+  }
 
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
@@ -177,10 +215,7 @@ async function startSession(sessionId) {
 
   // Auto-resposta: quando um cliente manda mensagem, responde com o link/cardápio.
   sock.ev.on("messages.upsert", async ({ messages, type }) => {
-    // Batimento do watchdog: marca que ALGO chegou (inclui status@broadcast,
-    // que pinga o tempo todo numa conexão viva). É assim que detectamos a
-    // sessão "surda" — quando isso para de acontecer por muito tempo.
-    session.lastRecv = Date.now();
+    markRecv();
     const cfg = getConfig(sessionId);
     for (const msg of messages) {
       const jid = msg.key?.remoteJid || "";
@@ -526,17 +561,23 @@ app.get("/", (req, res) => {
 // mas para de RECEBER — o socket morreu em silêncio e o "close" nunca dispara,
 // então nada reconecta e a loja fica horas sem o bot até alguém perceber.
 //
-// Detectamos pelo tempo desde o último evento RECEBIDO (session.lastRecv). Numa
-// conexão viva os status@broadcast dos contatos chegam o tempo todo, então isso
-// é um batimento confiável — sondas ativas (onWhatsApp) NÃO servem porque
-// passam mesmo com a sessão surda. Passou do limite → derruba e reconecta com a
-// MESMA credencial (sem QR, sem perder conversa).
+// Detectamos pelo tempo desde o último evento RECEBIDO (session.lastRecv, ver
+// markRecv). Passou do limite → derruba e reconecta com a MESMA credencial (sem
+// QR, sem perder conversa). Sondas ativas (onWhatsApp) NÃO servem de teste:
+// passam mesmo com a sessão surda.
 //
-// Trava anti-tempestade (reconexões seguidas já deixaram TODAS as sessões
-// surdas uma vez): o lastRecv reseta ao reconectar, então cada sessão só é
-// reconectada, no máximo, uma vez por janela (WATCHDOG_STALE_MIN).
-const WATCHDOG_STALE_MS = Number(process.env.WATCHDOG_STALE_MIN || 15) * 60 * 1000;
+// Duas travas contra o watchdog virar o próprio problema — porque reconectar em
+// loop com a mesma credencial é justamente o caminho pro WhatsApp deslogar o
+// aparelho:
+//  1. Janela larga (45min). A janela antiga de 15min disparava em loja parada,
+//     reconectando sessão saudável a cada 16min a noite toda.
+//  2. Escalada + desistência. O lastRecv reseta ao reconectar, então sem isso a
+//     sessão surda de verdade era reconectada para sempre, num ciclo fixo. Cada
+//     tentativa frustrada alarga a janela; depois de MAX_STRIKES o watchdog para
+//     e avisa que o caso é de /reset + QR (problema de pareamento, não de socket).
+const WATCHDOG_STALE_MS = Number(process.env.WATCHDOG_STALE_MIN || 45) * 60 * 1000;
 const WATCHDOG_EVERY_MS = Number(process.env.WATCHDOG_EVERY_MIN || 2) * 60 * 1000;
+const WATCHDOG_MAX_STRIKES = Number(process.env.WATCHDOG_MAX_STRIKES || 3);
 
 function softReconnect(sessionId, reason) {
   const session = sessions.get(sessionId);
@@ -550,6 +591,15 @@ function softReconnect(sessionId, reason) {
   session.connecting = false;
   try { old?.ev?.removeAllListeners?.(); } catch {}
   try { old?.end?.(); } catch {}
+  // Conta a tentativa. Só zera quando algo REALMENTE chegar (markRecv) — o
+  // "open" da reconexão não vale como prova de que a sessão voltou a ouvir.
+  session.watchdogStrikes = (session.watchdogStrikes || 0) + 1;
+  if (session.watchdogStrikes >= WATCHDOG_MAX_STRIKES) {
+    dbg(
+      `[${sessionId}] ⚠️ watchdog desistindo após ${session.watchdogStrikes} reconexões sem ` +
+        `receber nada. Provável pareamento quebrado — precisa de /reset/${sessionId} e reescanear o QR.`
+    );
+  }
   startSession(sessionId);
 }
 
@@ -558,12 +608,17 @@ function watchdogTick() {
   for (const [sessionId, session] of sessions.entries()) {
     if (!session.isConnected || !session.sock) continue; // só as "conectadas"
     const last = session.lastRecv || 0;
-    if (last && now - last > WATCHDOG_STALE_MS) {
-      softReconnect(
-        sessionId,
-        `sem receber nada há ${Math.round((now - last) / 60000)}min (provável sessão surda)`
-      );
-    }
+    if (!last) continue;
+    const strikes = session.watchdogStrikes || 0;
+    if (strikes >= WATCHDOG_MAX_STRIKES) continue; // já desistiu: espera /reset
+    // A janela cresce a cada tentativa frustrada (45min, 90min, 135min): se
+    // reconectar não resolveu, insistir no mesmo ritmo só machuca a credencial.
+    if (now - last <= WATCHDOG_STALE_MS * (strikes + 1)) continue;
+    softReconnect(
+      sessionId,
+      `sem receber nada há ${Math.round((now - last) / 60000)}min ` +
+        `(tentativa ${strikes + 1}/${WATCHDOG_MAX_STRIKES})`
+    );
   }
 }
 
@@ -575,8 +630,11 @@ app.listen(PORT, () => {
   for (const sv of pendingSurveys) scheduleSurvey(sv);
   // Liga o watchdog de sessão surda.
   setInterval(watchdogTick, WATCHDOG_EVERY_MS);
-  console.log(
+  // Via dbg (não console.log) pra config efetiva aparecer no /debug: se houver
+  // uma variável antiga no Railway sobrescrevendo o padrão, dá pra ver daqui.
+  dbg(
     `Watchdog ativo: checa a cada ${WATCHDOG_EVERY_MS / 60000}min; ` +
-      `reconecta sessão sem receber há +${WATCHDOG_STALE_MS / 60000}min.`
+      `reconecta sessão sem receber há +${WATCHDOG_STALE_MS / 60000}min; ` +
+      `desiste após ${WATCHDOG_MAX_STRIKES} tentativas.`
   );
 });
