@@ -135,7 +135,21 @@ async function startSession(sessionId) {
     // Não rouba a presença "online" do celular (evita briga de presença).
     markOnlineOnConnect: false,
     keepAliveIntervalMs: 25000,
+    // Não baixar o histórico inteiro (anos de conversa) continua sendo o certo.
     syncFullHistory: false,
+    // ...MAS é obrigatório passar esta função junto. O Socket/index.js do
+    // Baileys sobrescreve o padrão da lib (`() => true`) por
+    // `() => !!syncFullHistory` quando a gente não passa a nossa — ou seja,
+    // com syncFullHistory:false ele passa a REJEITAR todo history sync,
+    // inclusive o INITIAL_BOOTSTRAP. É por esse canal que chega o mapeamento
+    // LID (o identificador que substituiu o número de telefone e para o qual
+    // a WhatsApp vem migrando as contas, uma a uma). Sem esse mapa o servidor
+    // não roteia a mensagem que chega e o messages.upsert NUNCA dispara: a
+    // sessão fica conectada, ainda envia, e simplesmente não recebe.
+    // Aceitar os tipos de sync não baixa histórico — só deixa o mapa chegar.
+    // Responder mensagem velha não é risco: a auto-resposta exige type
+    // "notify", e histórico não vem como notify.
+    shouldSyncHistoryMessage: () => true,
   });
   session.sock = sock;
   session.connecting = false;
