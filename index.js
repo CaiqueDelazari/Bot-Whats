@@ -26,6 +26,9 @@ const BOT_TOKEN = process.env.BOT_TOKEN || "";
 // Tempo mínimo (minutos) entre auto-respostas para o MESMO contato, para não
 // responder toda mensagem numa conversa. 0 = responde sempre. Padrão: 6h.
 const COOLDOWN_MIN = Number(process.env.AUTOREPLY_COOLDOWN_MIN ?? 360);
+// Número (com DDI, só dígitos) que recebe os avisos de sessão com problema.
+// Ex: ALERT_TO="5514999999999". Vazio = não avisa ninguém.
+const ALERT_TO = String(process.env.ALERT_TO || "").replace(/\D/g, "");
 
 // Uma sessão por cliente/número. sessionId -> { sock, isConnected, lastQR }
 const sessions = new Map();
@@ -34,11 +37,40 @@ const lastReply = new Map();
 
 // Buffer de debug em memória (últimas N linhas) — exposto em GET /debug pra
 // diagnosticar à distância sem precisar dos logs do Railway.
+//
+// O buffer sozinho não bastava: ele é pequeno e some no restart. Numa noite de
+// 01/08 uma loja movimentada encheu as 200 linhas e empurrou pra fora todo o
+// rastro da OUTRA loja, que era justamente a que tinha quebrado — e o restart
+// que veio depois levou o resto. Ficamos sem como investigar o incidente.
+// Agora cada linha também vai pra um arquivo no Volume, que sobrevive a
+// restart e não é disputado entre as sessões. Em GET /debug/arquivo.
 const debugLog = [];
+const LOG_PATH = path.join(AUTH_DIR, "debug.log");
+const LOG_MAX_BYTES = Number(process.env.LOG_MAX_MB || 5) * 1024 * 1024;
+
+function appendLogFile(line) {
+  try {
+    fs.mkdirSync(AUTH_DIR, { recursive: true });
+    // Rotação simples: ao estourar, vira .1 (só um histórico) e recomeça. Sem
+    // isso o arquivo cresce pra sempre e um dia enche o disco do Volume.
+    let size = 0;
+    try { size = fs.statSync(LOG_PATH).size; } catch {}
+    if (size > LOG_MAX_BYTES) {
+      try { fs.renameSync(LOG_PATH, `${LOG_PATH}.1`); } catch {}
+    }
+    fs.appendFileSync(LOG_PATH, line + "\n");
+  } catch {
+    // Log é diagnóstico: se o disco falhar, o bot segue atendendo.
+  }
+}
+
 function dbg(line) {
-  const stamp = new Date().toISOString().slice(11, 19);
-  debugLog.push(`${stamp} ${line}`);
+  // Data completa no arquivo (um log que atravessa dias precisa dela); no
+  // buffer da tela fica só a hora, que é como sempre foi lido.
+  const now = new Date().toISOString();
+  debugLog.push(`${now.slice(11, 19)} ${line}`);
   if (debugLog.length > 200) debugLog.shift();
+  appendLogFile(`${now.slice(0, 19).replace("T", " ")} ${line}`);
   console.log(line);
 }
 
@@ -204,6 +236,13 @@ async function startSession(sessionId) {
   function markRecv() {
     session.lastRecv = Date.now();
     session.watchdogStrikes = 0; // ouviu de verdade: zera a escalada
+    // Voltou a ouvir: limpa o estado de alarme pra que uma próxima queda
+    // avise de novo em vez de ficar em silêncio achando que já avisou.
+    if (session.desistiu) {
+      session.desistiu = false;
+      alertasEnviados.delete(sessionId);
+      dbg(`[${sessionId}] ✅ voltou a receber`);
+    }
   }
   for (const evt of [
     "messages.update",
@@ -515,6 +554,21 @@ app.get("/debug", (req, res) => {
   res.type("text/plain").send(debugLog.join("\n") || "(sem eventos ainda)");
 });
 
+// Log persistido no Volume — sobrevive a restart e não é disputado entre as
+// sessões. ?linhas=N pega só o fim; ?sessao=xxx filtra uma loja.
+app.get("/debug/arquivo", (req, res) => {
+  const limite = Math.min(Number(req.query.linhas) || 500, 5000);
+  const sessao = sanitize(req.query.sessao || "");
+  let texto = "";
+  for (const p of [`${LOG_PATH}.1`, LOG_PATH]) {
+    try { texto += fs.readFileSync(p, "utf8"); } catch {}
+  }
+  if (!texto) return res.type("text/plain").send("(arquivo de log ainda vazio)");
+  let linhas = texto.split("\n").filter(Boolean);
+  if (sessao) linhas = linhas.filter((l) => l.includes(`[${sessao}]`));
+  res.type("text/plain").send(linhas.slice(-limite).join("\n") || "(nada com esse filtro)");
+});
+
 // Reset: força re-pareamento. Desloga de verdade, apaga as credenciais
 // quebradas e sobe a sessão limpa pra gerar um QR novo. Usar quando a sessão
 // fica "zumbi" (envia mas não recebe). Redireciona pro QR.
@@ -562,6 +616,25 @@ app.get("/reconnect/:sessionId", (req, res) => {
 // Saúde das sessões: mostra há quanto tempo cada uma recebeu ALGO. É o que o
 // /debug não conta — o batimento (markRecv) inclui recibos e presença, que não
 // são logados. "recebeuHaMin" alto numa sessão connected = sessão surda.
+// Refaz as sessões de criptografia mantendo o pareamento — sem QR.
+// Degrau entre /reconnect (não cura surdez) e /reset (exige o celular).
+app.get("/resync/:sessionId", (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessions.has(sessionId)) return res.status(404).send("Sessão não encontrada");
+  const apagados = resyncSession(sessionId, "pedido manual via /resync");
+  const session = sessions.get(sessionId);
+  if (session) { session.watchdogStrikes = 0; session.desistiu = false; }
+  alertasEnviados.delete(sessionId);
+  res.send(
+    `<html><body style="font-family:sans-serif;padding:40px">
+     <h2>Sessão "${sessionId}" — resync 🔄</h2>
+     <p>${apagados} sessões de criptografia apagadas. O pareamento foi mantido: <b>não precisa escanear QR</b>.</p>
+     <p>Elas se refazem sozinhas conforme as mensagens chegam. Acompanhe em
+        <a href="/health">/health</a> — o <code>recebeuHaMin</code> tem que voltar a zerar.</p>
+     </body></html>`
+  );
+});
+
 app.get("/health", (req, res) => {
   const now = Date.now();
   res.json({
@@ -569,6 +642,7 @@ app.get("/health", (req, res) => {
       janelaMin: WATCHDOG_STALE_MS / 60000,
       checaCadaMin: WATCHDOG_EVERY_MS / 60000,
       maxTentativas: WATCHDOG_MAX_STRIKES,
+      avisaEm: ALERT_TO ? `${ALERT_TO.slice(0, 4)}…${ALERT_TO.slice(-4)}` : "(ALERT_TO não configurado)",
     },
     sessoes: [...sessions.entries()].map(([id, s]) => ({
       id,
@@ -576,6 +650,8 @@ app.get("/health", (req, res) => {
       recebeuHaMin: s.lastRecv ? Math.round((now - s.lastRecv) / 60000) : null,
       tentativasWatchdog: s.watchdogStrikes || 0,
       aguardandoQR: Boolean(s.lastQR),
+      // true = watchdog esgotou reconexão e resync; só resta /reset + QR
+      precisaQR: Boolean(s.desistiu),
     })),
   });
 });
@@ -672,6 +748,87 @@ const WATCHDOG_STALE_MS = Number(process.env.WATCHDOG_STALE_MIN || 45) * 60 * 10
 const WATCHDOG_EVERY_MS = Number(process.env.WATCHDOG_EVERY_MIN || 2) * 60 * 1000;
 const WATCHDOG_MAX_STRIKES = Number(process.env.WATCHDOG_MAX_STRIKES || 3);
 
+// ── Aviso no WhatsApp quando uma sessão dá problema ────────────────────────
+// A falha mais cara não é a sessão cair: é ninguém ficar sabendo. Em 01/08 uma
+// loja ficou 2h sem receber e outra 8h — as duas descobertas por reclamação de
+// cliente, muito depois. O watchdog já detectava e escrevia no /debug, que
+// ninguém lê. Aqui ele passa a avisar de verdade, usando qualquer sessão
+// saudável pra mandar a mensagem (o problema é de uma sessão, não do bot).
+const alertasEnviados = new Map(); // sessionId -> timestamp do último aviso
+const ALERT_COOLDOWN_MS = 30 * 60 * 1000;
+
+async function alertar(sessionId, texto) {
+  dbg(`[${sessionId}] 🚨 ALERTA: ${texto}`);
+  if (!ALERT_TO) return;
+  // Não repetir o mesmo alarme a cada tique do watchdog.
+  const ultimo = alertasEnviados.get(sessionId) || 0;
+  if (Date.now() - ultimo < ALERT_COOLDOWN_MS) return;
+
+  // Manda por uma sessão que esteja ouvindo de verdade — uma sessão surda até
+  // consegue enviar, mas se ela for a quebrada é melhor não depender dela.
+  const agora = Date.now();
+  const remetente = [...sessions.entries()].find(
+    ([id, s]) =>
+      id !== sessionId && s.isConnected && s.sock &&
+      s.lastRecv && agora - s.lastRecv < WATCHDOG_STALE_MS
+  );
+  if (!remetente) {
+    dbg(`[${sessionId}] ⚠️ sem sessão saudável pra enviar o alerta — só ficou no log`);
+    return;
+  }
+  try {
+    await remetente[1].sock.sendMessage(`${ALERT_TO}@s.whatsapp.net`, {
+      text: `🚨 *Bot WhatsApp*\n\nSessão *${sessionId}*: ${texto}`,
+    });
+    alertasEnviados.set(sessionId, Date.now());
+    dbg(`[${sessionId}] alerta enviado via ${remetente[0]}`);
+  } catch (err) {
+    dbg(`[${sessionId}] ⚠️ falhou ao enviar alerta: ${err.message}`);
+  }
+}
+
+// ── Resync: reconstrói as sessões de cripto SEM perder o pareamento ────────
+// Degrau que faltava entre /reconnect (fraco: recarrega as mesmas sessões
+// quebradas, já provou não resolver a surdez) e /reset (forte demais: apaga a
+// credencial e exige reescanear o QR com o celular da loja).
+//
+// O useMultiFileAuthState guarda cada coisa num arquivo: creds.json é o
+// pareamento, e session-*/sender-key-* são as sessões de criptografia por
+// contato. Dá pra apagar só estas últimas — o pareamento fica de pé, nada de
+// QR. Elas se refazem sozinhas quando a próxima mensagem chega, ainda mais com
+// o enableAutoSessionRecreation do Baileys 7 (ligado por padrão), que já recria
+// sessão quebrada ao falhar a decifragem.
+//
+// Não mexe em pre-key-* nem app-state-sync-*: as pre-keys já foram publicadas
+// no servidor e apagá-las quebraria quem as usasse.
+function resyncSession(sessionId, motivo) {
+  const authPath = path.join(AUTH_DIR, sessionId);
+  let apagados = 0;
+  try {
+    for (const f of fs.readdirSync(authPath)) {
+      if (/^(session-|sender-key-)/.test(f)) {
+        try { fs.unlinkSync(path.join(authPath, f)); apagados++; } catch {}
+      }
+    }
+  } catch (err) {
+    dbg(`[${sessionId}] resync falhou ao ler ${authPath}: ${err.message}`);
+    return 0;
+  }
+  dbg(`[${sessionId}] RESYNC (${motivo}) — ${apagados} sessões de cripto apagadas, credencial mantida (sem QR)`);
+
+  const session = sessions.get(sessionId);
+  if (session) {
+    const old = session.sock;
+    session.sock = null;
+    session.isConnected = false;
+    session.connecting = false;
+    try { old?.ev?.removeAllListeners?.(); } catch {}
+    try { old?.end?.(); } catch {}
+  }
+  startSession(sessionId);
+  return apagados;
+}
+
 function softReconnect(sessionId, reason) {
   const session = sessions.get(sessionId);
   if (!session) return;
@@ -687,15 +844,17 @@ function softReconnect(sessionId, reason) {
   // Conta a tentativa. Só zera quando algo REALMENTE chegar (markRecv) — o
   // "open" da reconexão não vale como prova de que a sessão voltou a ouvir.
   session.watchdogStrikes = (session.watchdogStrikes || 0) + 1;
-  if (session.watchdogStrikes >= WATCHDOG_MAX_STRIKES) {
-    dbg(
-      `[${sessionId}] ⚠️ watchdog desistindo após ${session.watchdogStrikes} reconexões sem ` +
-        `receber nada. Provável pareamento quebrado — precisa de /reset/${sessionId} e reescanear o QR.`
-    );
-  }
   startSession(sessionId);
 }
 
+// Escada de recuperação, do mais leve pro mais pesado. Antes o watchdog só
+// sabia reconectar — e reconectar nunca curou a surdez (provado nas duas
+// paradas de 01/08: 3 tentativas na espeto-na-brasa, nenhuma resolveu). Aí ele
+// desistia escrevendo uma linha no /debug que ninguém lia.
+//
+//   1..N-1  reconexão simples (resolve queda de rede, que é o caso comum)
+//   N       resync: apaga as sessões de cripto, mantém o pareamento (sem QR)
+//   > N     desiste de agir sozinho e AVISA — só resta /reset + QR
 function watchdogTick() {
   const now = Date.now();
   for (const [sessionId, session] of sessions.entries()) {
@@ -703,15 +862,36 @@ function watchdogTick() {
     const last = session.lastRecv || 0;
     if (!last) continue;
     const strikes = session.watchdogStrikes || 0;
-    if (strikes >= WATCHDOG_MAX_STRIKES) continue; // já desistiu: espera /reset
-    // A janela cresce a cada tentativa frustrada (45min, 90min, 135min): se
+    const paradaMin = Math.round((now - last) / 60000);
+
+    // A janela cresce a cada tentativa frustrada (45min, 90min, 135min...): se
     // reconectar não resolveu, insistir no mesmo ritmo só machuca a credencial.
     if (now - last <= WATCHDOG_STALE_MS * (strikes + 1)) continue;
-    softReconnect(
-      sessionId,
-      `sem receber nada há ${Math.round((now - last) / 60000)}min ` +
-        `(tentativa ${strikes + 1}/${WATCHDOG_MAX_STRIKES})`
-    );
+
+    if (strikes < WATCHDOG_MAX_STRIKES - 1) {
+      softReconnect(
+        sessionId,
+        `sem receber nada há ${paradaMin}min (tentativa ${strikes + 1}/${WATCHDOG_MAX_STRIKES})`
+      );
+    } else if (strikes === WATCHDOG_MAX_STRIKES - 1) {
+      // Reconectar já não resolveu: o problema não é o socket. Antes de exigir
+      // o celular, tenta refazer as sessões de criptografia.
+      session.watchdogStrikes = strikes + 1;
+      resyncSession(sessionId, `sem receber nada há ${paradaMin}min, reconexão não resolveu`);
+      alertar(
+        sessionId,
+        `parou de receber há ${paradaMin}min. Reconectar não resolveu — refazendo as ` +
+          `sessões de criptografia (sem QR). Confira em /health se volta a receber.`
+      );
+    } else if (!session.desistiu) {
+      // Marca pra avisar uma vez só; o cooldown do alertar() cobre o resto.
+      session.desistiu = true;
+      alertar(
+        sessionId,
+        `parou de receber há ${paradaMin}min e não voltou nem com reconexão nem com ` +
+          `resync. Precisa de /reset/${sessionId} e reescanear o QR no celular da loja.`
+      );
+    }
   }
 }
 
