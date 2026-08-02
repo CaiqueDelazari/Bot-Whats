@@ -9,7 +9,7 @@ const {
   fetchLatestBaileysVersion,
   makeCacheableSignalKeyStore,
   Browsers,
-} = require("@whiskeysockets/baileys");
+} = require("baileys");
 const { Boom } = require("@hapi/boom");
 const P = require("pino");
 
@@ -85,6 +85,40 @@ function saveConfig(sessionId, cfg) {
   fs.writeFileSync(configPath(sessionId), JSON.stringify(cfg, null, 2));
 }
 
+// ── Versão do protocolo do WhatsApp Web ─────────────────────────────────────
+// Era buscada A CADA startSession. Duas armadilhas nisso:
+//  1. `fetchLatestBaileysVersion()` NÃO propaga erro de rede: no catch ele
+//     devolve a versão embutida na lib com `isLatest:false`, calado. Como o bot
+//     ignorava esse campo, uma sessão que subiu durante uma oscilação de rede
+//     passava a rodar num protocolo DIFERENTE das outras — no mesmo processo,
+//     sem nada no log dizendo isso.
+//  2. Reconexão do watchdog re-buscava a versão. Uma sessão que reconectasse
+//     depois de a WhatsApp publicar uma versão nova ficava dessincronizada das
+//     demais sem ninguém ter mexido em nada.
+// Agora é buscada UMA vez, no boot, e compartilhada por todas as sessões. Dá
+// pra fixar com WA_VERSION="2.3000.1023223821" se uma versão nova quebrar algo.
+let waVersionCache = null;
+async function getWAVersion() {
+  if (waVersionCache) return waVersionCache;
+  const pin = String(process.env.WA_VERSION || "").trim();
+  if (pin) {
+    const parts = pin.split(".").map(Number);
+    if (parts.length === 3 && parts.every(Number.isFinite)) {
+      waVersionCache = parts;
+      dbg(`Versão do WhatsApp Web FIXADA por WA_VERSION: ${parts.join(".")}`);
+      return waVersionCache;
+    }
+    dbg(`⚠️ WA_VERSION inválida ("${pin}") — ignorando e buscando a atual.`);
+  }
+  const { version, isLatest } = await fetchLatestBaileysVersion();
+  waVersionCache = version;
+  dbg(
+    `Versão do WhatsApp Web: ${version.join(".")} ` +
+      (isLatest ? "(buscada agora)" : "⚠️ (FALLBACK embutido — a busca falhou)")
+  );
+  return waVersionCache;
+}
+
 async function startSession(sessionId) {
   let session = sessions.get(sessionId);
   // Já está rodando OU em pleno processo de subir um socket: não cria outro.
@@ -106,10 +140,10 @@ async function startSession(sessionId) {
   session.connecting = true;
 
   const authPath = path.join(AUTH_DIR, sessionId);
-  let state, saveCreds, version;
+  let state, saveCreds;
+  const version = await getWAVersion();
   try {
     ({ state, saveCreds } = await useMultiFileAuthState(authPath));
-    ({ version } = await fetchLatestBaileysVersion());
   } catch (err) {
     // Falha ao iniciar (ex.: sem rede): libera o guard e tenta de novo depois.
     session.connecting = false;
@@ -141,14 +175,10 @@ async function startSession(sessionId) {
     // Baileys sobrescreve o padrão da lib (`() => true`) por
     // `() => !!syncFullHistory` quando a gente não passa a nossa — ou seja,
     // com syncFullHistory:false ele passa a REJEITAR todo history sync,
-    // inclusive o INITIAL_BOOTSTRAP. É por esse canal que chega o mapeamento
-    // LID (o identificador que substituiu o número de telefone e para o qual
-    // a WhatsApp vem migrando as contas, uma a uma). Sem esse mapa o servidor
-    // não roteia a mensagem que chega e o messages.upsert NUNCA dispara: a
-    // sessão fica conectada, ainda envia, e simplesmente não recebe.
-    // Aceitar os tipos de sync não baixa histórico — só deixa o mapa chegar.
-    // Responder mensagem velha não é risco: a auto-resposta exige type
-    // "notify", e histórico não vem como notify.
+    // inclusive o INITIAL_BOOTSTRAP, por onde chega o estado inicial dos chats.
+    // Aceitar os tipos de sync não baixa histórico. Responder mensagem velha
+    // não é risco: a auto-resposta exige type "notify", e histórico não vem
+    // como notify.
     shouldSyncHistoryMessage: () => true,
   });
   session.sock = sock;
