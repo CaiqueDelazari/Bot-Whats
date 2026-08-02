@@ -97,26 +97,34 @@ function saveConfig(sessionId, cfg) {
 //     demais sem ninguém ter mexido em nada.
 // Agora é buscada UMA vez, no boot, e compartilhada por todas as sessões. Dá
 // pra fixar com WA_VERSION="2.3000.1023223821" se uma versão nova quebrar algo.
-let waVersionCache = null;
-async function getWAVersion() {
-  if (waVersionCache) return waVersionCache;
+//
+// O cache guarda a PROMESSA, não o valor resolvido. Guardando o valor, o
+// restoreSessions() do boot chamava startSession() de todas as sessões em
+// sequência e cada uma passava pelo `if` antes de a primeira busca terminar —
+// resultado: N buscas em paralelo, que é exatamente o que isso veio evitar.
+// Com a promessa, quem chega depois espera a mesma busca.
+let waVersionPromise = null;
+function getWAVersion() {
+  if (!waVersionPromise) waVersionPromise = resolveWAVersion();
+  return waVersionPromise;
+}
+
+async function resolveWAVersion() {
   const pin = String(process.env.WA_VERSION || "").trim();
   if (pin) {
     const parts = pin.split(".").map(Number);
     if (parts.length === 3 && parts.every(Number.isFinite)) {
-      waVersionCache = parts;
       dbg(`Versão do WhatsApp Web FIXADA por WA_VERSION: ${parts.join(".")}`);
-      return waVersionCache;
+      return parts;
     }
     dbg(`⚠️ WA_VERSION inválida ("${pin}") — ignorando e buscando a atual.`);
   }
   const { version, isLatest } = await fetchLatestBaileysVersion();
-  waVersionCache = version;
   dbg(
     `Versão do WhatsApp Web: ${version.join(".")} ` +
       (isLatest ? "(buscada agora)" : "⚠️ (FALLBACK embutido — a busca falhou)")
   );
-  return waVersionCache;
+  return version;
 }
 
 async function startSession(sessionId) {
