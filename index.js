@@ -2,6 +2,7 @@ const express = require("express");
 const QRCode = require("qrcode");
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 const {
   makeWASocket,
   useMultiFileAuthState,
@@ -21,8 +22,24 @@ const PORT = process.env.PORT || 3001;
 // (ex: /data) definindo AUTH_DIR — senão os QRs precisam ser reescaneados
 // a cada restart. Cada cliente vira uma subpasta dentro daqui.
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
-// Token de segurança: se definido, o /send exige Authorization: Bearer <token>.
+// Token de segurança. Este serviço fica exposto na internet e TODA rota dele é
+// operação da loja: enviar mensagem, ler o log, derrubar sessão, abrir o QR de
+// pareamento. O repositório é público, então os endereços não são segredo — o
+// token é a única barreira. Antes ele era opcional e, sem a variável, o bot
+// subia com tudo aberto; agora preferimos não subir a subir desprotegido.
 const BOT_TOKEN = process.env.BOT_TOKEN || "";
+if (!BOT_TOKEN) {
+  console.error(
+    "[bot] BOT_TOKEN não configurado — recusando subir com as rotas abertas."
+  );
+  console.error(
+    "      Defina BOT_TOKEN no Railway e o MESMO valor em WHATSAPP_BOT_TOKEN nas lojas (Vercel)."
+  );
+  console.error(
+    "      Gere um valor aleatório longo: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
+  );
+  process.exit(1);
+}
 // Tempo mínimo (minutos) entre auto-respostas para o MESMO contato, para não
 // responder toda mensagem numa conversa. 0 = responde sempre. Padrão: 6h.
 const COOLDOWN_MIN = Number(process.env.AUTOREPLY_COOLDOWN_MIN ?? 360);
@@ -453,13 +470,30 @@ function scheduleSurvey(sv) {
 
 // ── Rotas ────────────────────────────────────────────────────────────────
 
-// Verifica o token (quando BOT_TOKEN está definido). Retorna true se ok.
+// Verifica o token. As lojas mandam no header; as telas de operação (QR, log,
+// health) são abertas no navegador, onde não dá pra mandar header — por isso
+// vale também como ?token=. Comparação em tempo constante.
 function checkToken(req) {
-  if (!BOT_TOKEN) return true;
   const auth = req.headers.authorization || "";
-  const token = auth.startsWith("Bearer ") ? auth.slice(7) : "";
-  return token === BOT_TOKEN;
+  const doHeader = auth.startsWith("Bearer ") ? auth.slice(7) : "";
+  const recebido = doHeader || String(req.query.token || "");
+  if (recebido.length !== BOT_TOKEN.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(recebido), Buffer.from(BOT_TOKEN));
+  } catch {
+    return false;
+  }
 }
+
+// Portão único: nada neste serviço é público. Antes só /config, /send e
+// /schedule-survey checavam o token — /debug, /reset, /reconnect, /resync,
+// /status, /connect e a home ficavam abertos, o que deixava qualquer um ler o
+// log (telefone e mensagem de cliente), derrubar a sessão de todas as lojas ou
+// abrir o QR de pareamento. O gate cobre toda rota declarada abaixo dele.
+app.use((req, res, next) => {
+  if (checkToken(req)) return next();
+  res.status(401).type("text/plain").send("Não autorizado");
+});
 
 // Lê a config de auto-resposta de uma sessão.
 app.get("/config/:sessionId", (req, res) => {

@@ -12,3 +12,6 @@ npm-debug.log*
 # Variáveis de ambiente locais
 .env
 .env.local
+
+# Config de runtime de versao antiga (hoje vive dentro de auth/)
+config.json
