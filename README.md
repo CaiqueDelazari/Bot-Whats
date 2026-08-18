@@ -15,7 +15,7 @@ O bot mantém uma conexão de WhatsApp separada por sessão.
 |---|---|---|
 | `PORT` | Não | Porta (a Railway define sozinha) |
 | `AUTH_DIR` | **Sim na Railway** | Pasta das sessões. Use `/data/auth` com um Volume em `/data` para não perder as conexões a cada restart |
-| `BOT_TOKEN` | Recomendado | Protege o `/send`. Deve ser igual ao `WHATSAPP_BOT_TOKEN` das cópias do sistema |
+| `BOT_TOKEN` | **Sim** | Protege **todas** as rotas. Deve ser igual ao `WHATSAPP_BOT_TOKEN` das cópias do sistema. Sem ele o bot sobe trancado com um token aleatório e as lojas não conseguem enviar nada |
 
 ## Rodando localmente
 
@@ -28,12 +28,17 @@ Conectar um cliente: abra `http://localhost:3001/connect/ID-DO-CLIENTE` e escane
 
 ## Endpoints
 
+**Nenhuma rota é pública.** Toda requisição precisa do `BOT_TOKEN`, no header
+`Authorization: Bearer <token>` (é como as lojas chamam) ou como `?token=<token>`
+na URL — as telas de operação são abertas no navegador, onde não dá pra mandar
+header. Ex: `/health?token=SEU_BOT_TOKEN`.
+
 | Método | Rota | Descrição |
 |---|---|---|
 | GET | `/` | Lista todas as sessões e o status de cada uma |
 | GET | `/connect/:sessionId` | Página com o QR Code para conectar aquela sessão |
 | GET | `/status/:sessionId` | `{ session, connected }` |
-| POST | `/send` | Envia mensagem. Body: `{ session, phone, message }`. Header: `Authorization: Bearer <BOT_TOKEN>` |
+| POST | `/send` | Envia mensagem. Body: `{ session, phone, message }` |
 | GET | `/config/:sessionId` | Lê a config de auto-resposta da sessão |
 | POST | `/config/:sessionId` | Define a auto-resposta. Body: `{ autoReplyEnabled, autoReplyMessage }` |
 
