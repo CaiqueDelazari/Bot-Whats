@@ -24,13 +24,25 @@ const PORT = process.env.PORT || 3001;
 const AUTH_DIR = process.env.AUTH_DIR || "./auth";
 // Token de segurança. Este serviço fica exposto na internet e TODA rota dele é
 // operação da loja: enviar mensagem, ler o log, derrubar sessão, abrir o QR de
-// pareamento. O repositório é público, então os endereços não são segredo — o
-// token é a única barreira. Antes ele era opcional e, sem a variável, o bot
-// subia com tudo aberto; agora preferimos não subir a subir desprotegido.
-const BOT_TOKEN = process.env.BOT_TOKEN || "";
-if (!BOT_TOKEN) {
+// pareamento. O token é a única barreira — antes ele era opcional e, sem a
+// variável, o bot subia com tudo aberto, em silêncio.
+//
+// Faltando a variável NÃO abrimos as rotas: sorteamos um token efêmero que
+// ninguém conhece, o que na prática tranca o serviço por fora. O bot segue de
+// pé de propósito — assim as sessões do WhatsApp continuam conectadas e a
+// auto-resposta ao cliente continua funcionando, que é o que não depende de
+// ninguém autenticar. Só o que vem de fora (as lojas mandando pedido) fica
+// bloqueado até a variável ser configurada.
+//
+// A alternativa, derrubar o processo, tirava tudo do ar e ainda punha o Railway
+// em ciclo de restart — caro demais para uma variável esquecida.
+const BOT_TOKEN = process.env.BOT_TOKEN || crypto.randomBytes(32).toString("hex");
+if (!process.env.BOT_TOKEN) {
   console.error(
-    "[bot] BOT_TOKEN não configurado — recusando subir com as rotas abertas."
+    "[bot] BOT_TOKEN não configurado — rotas TRANCADAS com um token aleatório."
+  );
+  console.error(
+    "      As lojas NÃO conseguem enviar mensagem até você definir a variável."
   );
   console.error(
     "      Defina BOT_TOKEN no Railway e o MESMO valor em WHATSAPP_BOT_TOKEN nas lojas (Vercel)."
@@ -38,7 +50,6 @@ if (!BOT_TOKEN) {
   console.error(
     "      Gere um valor aleatório longo: node -e \"console.log(require('crypto').randomBytes(32).toString('hex'))\""
   );
-  process.exit(1);
 }
 // Tempo mínimo (minutos) entre auto-respostas para o MESMO contato, para não
 // responder toda mensagem numa conversa. 0 = responde sempre. Padrão: 6h.
