@@ -496,11 +496,56 @@ function checkToken(req) {
   }
 }
 
-// Portão único: nada neste serviço é público. Antes só /config, /send e
-// /schedule-survey checavam o token — /debug, /reset, /reconnect, /resync,
-// /status, /connect e a home ficavam abertos, o que deixava qualquer um ler o
-// log (telefone e mensagem de cliente), derrubar a sessão de todas as lojas ou
-// abrir o QR de pareamento. O gate cobre toda rota declarada abaixo dele.
+// ── /health: única rota antes do portão ─────────────────────────────────────
+//
+// Fica aberta porque quem consulta é o healthcheck da plataforma, que não tem
+// como mandar header nem token. Com ela atrás do portão o Railway levava 401,
+// marcava o serviço como não-saudável e reiniciava o container — derrubando a
+// sessão do WhatsApp de todas as lojas de tempos em tempos.
+//
+// Sem token o corpo é só sinal de vida: quantidade de sessões e quantas estão
+// conectadas. Nada que identifique loja ou cliente. Com token válido (o mesmo
+// `?token=` que já se usava no navegador) devolve o detalhe de sempre.
+app.get("/health", (req, res) => {
+  const now = Date.now();
+  const lista = [...sessions.entries()];
+
+  if (!checkToken(req)) {
+    return res.json({
+      ok: true,
+      uptimeMin: Math.round(process.uptime() / 60),
+      sessoes: lista.length,
+      conectadas: lista.filter(([, s]) => s.isConnected).length,
+    });
+  }
+
+  res.json({
+    ok: true,
+    uptimeMin: Math.round(process.uptime() / 60),
+    watchdog: {
+      janelaMin: WATCHDOG_STALE_MS / 60000,
+      checaCadaMin: WATCHDOG_EVERY_MS / 60000,
+      maxTentativas: WATCHDOG_MAX_STRIKES,
+      avisaEm: ALERT_TO ? `${ALERT_TO.slice(0, 4)}…${ALERT_TO.slice(-4)}` : "(ALERT_TO não configurado)",
+    },
+    sessoes: lista.map(([id, s]) => ({
+      id,
+      conectada: Boolean(s.isConnected),
+      recebeuHaMin: s.lastRecv ? Math.round((now - s.lastRecv) / 60000) : null,
+      tentativasWatchdog: s.watchdogStrikes || 0,
+      aguardandoQR: Boolean(s.lastQR),
+      // true = watchdog esgotou reconexão e resync; só resta /reset + QR
+      precisaQR: Boolean(s.desistiu),
+    })),
+  });
+});
+
+// Portão único: fora do /health acima, nada neste serviço é público. Antes só
+// /config, /send e /schedule-survey checavam o token — /debug, /reset,
+// /reconnect, /resync, /status, /connect e a home ficavam abertos, o que
+// deixava qualquer um ler o log (telefone e mensagem de cliente), derrubar a
+// sessão de todas as lojas ou abrir o QR de pareamento. O gate cobre toda rota
+// declarada abaixo dele.
 app.use((req, res, next) => {
   if (checkToken(req)) return next();
   res.status(401).type("text/plain").send("Não autorizado");
@@ -678,27 +723,6 @@ app.get("/resync/:sessionId", (req, res) => {
         <a href="/health">/health</a> — o <code>recebeuHaMin</code> tem que voltar a zerar.</p>
      </body></html>`
   );
-});
-
-app.get("/health", (req, res) => {
-  const now = Date.now();
-  res.json({
-    watchdog: {
-      janelaMin: WATCHDOG_STALE_MS / 60000,
-      checaCadaMin: WATCHDOG_EVERY_MS / 60000,
-      maxTentativas: WATCHDOG_MAX_STRIKES,
-      avisaEm: ALERT_TO ? `${ALERT_TO.slice(0, 4)}…${ALERT_TO.slice(-4)}` : "(ALERT_TO não configurado)",
-    },
-    sessoes: [...sessions.entries()].map(([id, s]) => ({
-      id,
-      conectada: Boolean(s.isConnected),
-      recebeuHaMin: s.lastRecv ? Math.round((now - s.lastRecv) / 60000) : null,
-      tentativasWatchdog: s.watchdogStrikes || 0,
-      aguardandoQR: Boolean(s.lastQR),
-      // true = watchdog esgotou reconexão e resync; só resta /reset + QR
-      precisaQR: Boolean(s.desistiu),
-    })),
-  });
 });
 
 // Status de uma sessão (JSON).

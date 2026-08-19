@@ -15,7 +15,7 @@ O bot mantém uma conexão de WhatsApp separada por sessão.
 |---|---|---|
 | `PORT` | Não | Porta (a Railway define sozinha) |
 | `AUTH_DIR` | **Sim na Railway** | Pasta das sessões. Use `/data/auth` com um Volume em `/data` para não perder as conexões a cada restart |
-| `BOT_TOKEN` | **Sim** | Protege **todas** as rotas. Deve ser igual ao `WHATSAPP_BOT_TOKEN` das cópias do sistema. Sem ele o bot sobe trancado com um token aleatório e as lojas não conseguem enviar nada |
+| `BOT_TOKEN` | **Sim** | Protege todas as rotas menos o `/health` reduzido. Deve ser igual ao `WHATSAPP_BOT_TOKEN` das cópias do sistema. Sem ele o bot sobe trancado com um token aleatório e as lojas não conseguem enviar nada |
 
 ## Rodando localmente
 
@@ -28,10 +28,17 @@ Conectar um cliente: abra `http://localhost:3001/connect/ID-DO-CLIENTE` e escane
 
 ## Endpoints
 
-**Nenhuma rota é pública.** Toda requisição precisa do `BOT_TOKEN`, no header
-`Authorization: Bearer <token>` (é como as lojas chamam) ou como `?token=<token>`
-na URL — as telas de operação são abertas no navegador, onde não dá pra mandar
-header. Ex: `/health?token=SEU_BOT_TOKEN`.
+**Só `/health` é pública** — e mesmo ela, sem token, devolve apenas sinal de
+vida (`{ ok, uptimeMin, sessoes, conectadas }`), sem id de loja nem dado de
+cliente. Ela precisa ficar aberta porque o healthcheck da plataforma não manda
+header: atrás do token o Railway leva 401, marca o serviço como não-saudável e
+reinicia o container, derrubando a sessão de todas as lojas.
+
+**Todas as outras exigem o `BOT_TOKEN`**, no header `Authorization: Bearer
+<token>` (é como as lojas chamam) ou como `?token=<token>` na URL — as telas de
+operação são abertas no navegador, onde não dá pra mandar header. O mesmo
+`?token=` em `/health` devolve o diagnóstico completo (watchdog e sessões):
+`/health?token=SEU_BOT_TOKEN`.
 
 | Método | Rota | Descrição |
 |---|---|---|
