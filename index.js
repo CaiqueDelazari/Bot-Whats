@@ -732,6 +732,72 @@ app.get("/status/:sessionId", (req, res) => {
   res.json({ session: sessionId, connected: Boolean(session?.isConnected) });
 });
 
+// ── Sessões em JSON, para quem tem tela própria ─────────────────────────────
+// /connect/:id devolve uma página HTML: serve para o dono abrir no navegador,
+// mas não para outro sistema desenhar a conexão dentro da tela dele. O ERP
+// mostra o QR no painel do próprio cliente, então precisa do dado cru.
+//
+// A página HTML continua igual — quem já usa não muda nada.
+
+/** Retrato de uma sessão no vocabulário de quem consome, com o QR já pronto. */
+async function retratoDaSessao(sessionId) {
+  const session = sessions.get(sessionId);
+  if (session?.isConnected) {
+    return {
+      status: "conectado",
+      qrcode: "",
+      // `id` do Baileys vem como "5514999990000:12@s.whatsapp.net".
+      numero: String(session.sock?.user?.id || "").split(/[:@]/)[0],
+    };
+  }
+  if (session?.lastQR) {
+    return {
+      status: "aguardando_leitura",
+      qrcode: await QRCode.toDataURL(session.lastQR, { width: 300 }),
+      numero: "",
+    };
+  }
+  return { status: "desconectado", qrcode: "", numero: "" };
+}
+
+/** Espera o QR nascer, porque ele não vem junto com o socket.
+ *
+ * `startSession` devolve assim que cria o socket, mas o QR chega depois, num
+ * evento do Baileys — alguns segundos. Sem esta espera, quem chamou recebia
+ * "desconectado" no primeiro pedido e concluía que a conexão falhou.
+ */
+async function esperarQR(sessionId, limiteMs = 12000) {
+  const fim = Date.now() + limiteMs;
+  while (Date.now() < fim) {
+    const session = sessions.get(sessionId);
+    if (session?.isConnected || session?.lastQR) break;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+  return retratoDaSessao(sessionId);
+}
+
+app.get("/api/sessoes/:sessionId", async (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: "Sessão inválida" });
+  try {
+    res.json(await retratoDaSessao(sessionId));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post("/api/sessoes/:sessionId/conectar", async (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: "Sessão inválida" });
+  try {
+    const session = sessions.get(sessionId);
+    if (!session?.sock) await startSession(sessionId);
+    res.json(await esperarQR(sessionId));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // Página para conectar uma sessão (mostra o QR Code).
 app.get("/connect/:sessionId", async (req, res) => {
   const sessionId = sanitize(req.params.sessionId);
