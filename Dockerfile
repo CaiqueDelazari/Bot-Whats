@@ -20,7 +20,13 @@ EXPOSE 3001
 
 # /health e a unica rota antes do portao de token — de proposito, para que o
 # healthcheck nao precise carregar segredo nenhum.
+#
+# A porta vem do ambiente, nao fixa: o index.js escuta em `process.env.PORT`, e
+# uma PaaS injeta a dela (a Railway injeta). Com 3001 cravado aqui, o app subia
+# na porta da plataforma, o healthcheck batia na 3001, dava ruim, e o container
+# entrava em ciclo de restart — derrubando a sessao de WhatsApp de todas as
+# lojas a cada reinicio.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-  CMD wget -qO- http://127.0.0.1:3001/health || exit 1
+  CMD wget -qO- "http://127.0.0.1:${PORT:-3001}/health" || exit 1
 
 CMD ["node", "index.js"]
