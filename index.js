@@ -295,12 +295,21 @@ async function startSession(sessionId) {
   sock.ev.on("connection.update", async ({ connection, lastDisconnect, qr }) => {
     if (qr) {
       session.lastQR = qr;
+      // Hora em que este QR nasceu. O WhatsApp troca o código a cada ~20s e o
+      // anterior morre na hora; sem esta marca não havia como saber se o que
+      // está guardado ainda vale. Ver QR_TTL_MS.
+      session.lastQRAt = Date.now();
       console.log(`[${sessionId}] QR Code gerado — abra /connect/${sessionId} para escanear`);
     }
 
     if (connection === "close") {
       session.isConnected = false;
       session.sock = null;
+      // O QR morre junto com o socket que o emitiu. Guardá-lo era o que fazia a
+      // tela de pareamento mostrar, por minutos a fio, um código que o celular
+      // recusava com "verifique sua conexão" — e ninguém entendia por quê.
+      session.lastQR = null;
+      session.lastQRAt = 0;
       // Desliga de vez o socket morto: sem isso, eventos atrasados dele
       // disparam reconexões paralelas e viram socket duplicado (= logout).
       try { sock.ev.removeAllListeners(); } catch {}
@@ -533,7 +542,7 @@ app.get("/health", (req, res) => {
       conectada: Boolean(s.isConnected),
       recebeuHaMin: s.lastRecv ? Math.round((now - s.lastRecv) / 60000) : null,
       tentativasWatchdog: s.watchdogStrikes || 0,
-      aguardandoQR: Boolean(s.lastQR),
+      aguardandoQR: qrValido(s),
       // true = watchdog esgotou reconexão e resync; só resta /reset + QR
       precisaQR: Boolean(s.desistiu),
     })),
@@ -740,6 +749,18 @@ app.get("/status/:sessionId", (req, res) => {
 // A página HTML continua igual — quem já usa não muda nada.
 
 /** Retrato de uma sessão no vocabulário de quem consome, com o QR já pronto. */
+// Validade do QR. O WhatsApp rotaciona o código a cada ~20s; damos folga para
+// cobrir o intervalo entre a geração e a tela do dono, mas nem perto dos
+// minutos que o código ficava guardado antes.
+const QR_TTL_MS = Number(process.env.QR_TTL_SEG || 45) * 1000;
+
+/** O QR guardado ainda vale? Código vencido é pior que nenhum: o celular
+ *  recusa com "verifique sua conexão" e a pessoa culpa o telefone. */
+function qrValido(session) {
+  if (!session?.lastQR) return false;
+  return Date.now() - (session.lastQRAt || 0) < QR_TTL_MS;
+}
+
 async function retratoDaSessao(sessionId) {
   const session = sessions.get(sessionId);
   if (session?.isConnected) {
@@ -750,7 +771,7 @@ async function retratoDaSessao(sessionId) {
       numero: String(session.sock?.user?.id || "").split(/[:@]/)[0],
     };
   }
-  if (session?.lastQR) {
+  if (qrValido(session)) {
     return {
       status: "aguardando_leitura",
       qrcode: await QRCode.toDataURL(session.lastQR, { width: 300 }),
@@ -770,7 +791,9 @@ async function esperarQR(sessionId, limiteMs = 12000) {
   const fim = Date.now() + limiteMs;
   while (Date.now() < fim) {
     const session = sessions.get(sessionId);
-    if (session?.isConnected || session?.lastQR) break;
+    // Espera um QR que ainda valha. Aceitar qualquer `lastQR` fazia esta função
+    // devolver na hora o código do ciclo anterior, já vencido.
+    if (session?.isConnected || qrValido(session)) break;
     await new Promise((r) => setTimeout(r, 300));
   }
   return retratoDaSessao(sessionId);
@@ -814,7 +837,7 @@ app.get("/connect/:sessionId", async (req, res) => {
        </body></html>`
     );
   }
-  if (!session.lastQR) {
+  if (!qrValido(session)) {
     return res.send(
       `<html><head><meta http-equiv="refresh" content="3"></head>
        <body style="font-family:sans-serif;text-align:center;padding:40px">
