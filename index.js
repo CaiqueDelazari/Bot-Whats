@@ -549,6 +549,23 @@ app.get("/health", (req, res) => {
   });
 });
 
+// Link temporário de pareamento (criado em /qr-link, que exige token). A chave
+// longa e aleatória é a credencial: só mostra o QR daquela sessão, e só até vencer.
+const LINK_QR_MIN = 10;
+const linksQR = new Map(); // chave -> { sessionId, vence }
+app.get("/qr/:chave", async (req, res) => {
+  const link = linksQR.get(String(req.params.chave || ""));
+  res.set("Cache-Control", "no-store").set("Referrer-Policy", "no-referrer").set("X-Robots-Tag", "noindex");
+  if (!link || link.vence < Date.now()) {
+    if (link) linksQR.delete(String(req.params.chave));
+    return res.status(410).send(
+      `<html><body style="font-family:sans-serif;text-align:center;padding:40px">
+       <h2>Este link venceu</h2><p>Peça um link novo para quem cuida do sistema.</p></body></html>`
+    );
+  }
+  return paginaConectar(link.sessionId, res);
+});
+
 // Portão único: fora do /health acima, nada neste serviço é público. Antes só
 // /config, /send e /schedule-survey checavam o token — /debug, /reset,
 // /reconnect, /resync, /status, /connect e a home ficavam abertos, o que
@@ -825,6 +842,10 @@ app.post("/api/sessoes/:sessionId/conectar", async (req, res) => {
 app.get("/connect/:sessionId", async (req, res) => {
   const sessionId = sanitize(req.params.sessionId);
   if (!sessionId) return res.status(400).send("Sessão inválida");
+  return paginaConectar(sessionId, res);
+});
+
+async function paginaConectar(sessionId, res) {
 
   let session = sessions.get(sessionId);
   if (!session?.sock) session = await startSession(sessionId);
@@ -860,6 +881,20 @@ app.get("/connect/:sessionId", async (req, res) => {
   } catch (err) {
     res.status(500).send("Erro ao gerar QR Code");
   }
+}
+
+// Link temporário de pareamento: só o QR de UMA sessão, vence em 10 min.
+// Serve para mandar a quem está com o celular da loja — o /connect pede o
+// BOT_TOKEN, que abre todas as lojas e não pode sair daqui. Gerado com token.
+app.get("/qr-link/:sessionId", (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: "Sessão inválida" });
+  const chave = crypto.randomBytes(24).toString("hex");
+  const vence = Date.now() + LINK_QR_MIN * 60e3;
+  for (const [k, v] of linksQR) if (v.vence < Date.now()) linksQR.delete(k);
+  linksQR.set(chave, { sessionId, vence });
+  const base = `${req.headers["x-forwarded-proto"] || req.protocol}://${req.headers.host}`;
+  res.json({ url: `${base}/qr/${chave}`, sessionId, venceEm: new Date(vence).toISOString() });
 });
 
 // Página inicial: lista as sessões e o estado de cada uma.
