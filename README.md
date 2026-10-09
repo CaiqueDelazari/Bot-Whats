@@ -48,6 +48,8 @@ operação são abertas no navegador, onde não dá pra mandar header. O mesmo
 | POST | `/send` | Envia mensagem. Body: `{ session, phone, message }` |
 | GET | `/config/:sessionId` | Lê a config de auto-resposta da sessão |
 | POST | `/config/:sessionId` | Define a auto-resposta. Body: `{ autoReplyEnabled, autoReplyMessage }` |
+| GET | `/disco` | Espaço que cada sessão/arquivo ocupa no Volume |
+| POST | `/remover/:sessionId` | Apaga uma sessão **de vez** (credencial + config), sem recriar. Recusa sessão conectada |
 
 ## Auto-resposta (responder "oi" com o link)
 

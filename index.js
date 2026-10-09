@@ -210,6 +210,8 @@ async function startSession(sessionId) {
   const authPath = path.join(AUTH_DIR, sessionId);
   let state, saveCreds;
   const version = await getWAVersion();
+  // Removida (POST /remover) enquanto esperava: não sobe socket nem recria a pasta.
+  if (sessions.get(sessionId) !== session) return session;
   try {
     ({ state, saveCreds } = await useMultiFileAuthState(authPath));
   } catch (err) {
@@ -218,9 +220,10 @@ async function startSession(sessionId) {
     const delay = Math.min(30000, 2000 * 2 ** (session.retries || 0));
     session.retries = (session.retries || 0) + 1;
     console.error(`[${sessionId}] erro ao iniciar (${err.message}), tentando em ${Math.round(delay / 1000)}s...`);
-    setTimeout(() => startSession(sessionId), delay);
+    setTimeout(() => reiniciarSeAindaExiste(sessionId, session), delay);
     return session;
   }
+  if (sessions.get(sessionId) !== session) return session;
   const logger = P({ level: "silent" });
 
   const sock = makeWASocket({
@@ -326,7 +329,7 @@ async function startSession(sessionId) {
         const delay = Math.min(30000, 2000 * 2 ** (session.retries || 0));
         session.retries = (session.retries || 0) + 1;
         console.log(`[${sessionId}] conexão caiu (code=${code}), reconectando em ${Math.round(delay / 1000)}s...`);
-        setTimeout(() => startSession(sessionId), delay);
+        setTimeout(() => reiniciarSeAindaExiste(sessionId, session), delay);
       }
     }
 
@@ -390,6 +393,13 @@ async function startSession(sessionId) {
   });
 
   return session;
+}
+
+// Religação agendada (backoff). Só vale para a MESMA sessão que agendou: se ela
+// foi removida, ou trocada por um /reset, o timer antigo não ressuscita nada.
+// Antes, uma sessão sem uso que alguém apagasse voltava sozinha em até 30s.
+function reiniciarSeAindaExiste(sessionId, session) {
+  if (sessions.get(sessionId) === session) startSession(sessionId);
 }
 
 // Ao iniciar, reconecta automaticamente todas as sessões já salvas no disco.
@@ -707,6 +717,75 @@ app.get("/reset/:sessionId", async (req, res) => {
      <p><a href="/connect/${sessionId}">Clique aqui se não redirecionar</a></p>
      </body></html>`
   );
+});
+
+// Espaço do Volume por sessão. O Railway avisa "volume quase cheio" sem dizer
+// de quem é; sem isto a limpeza seria no chute.
+function tamanhoDe(p) {
+  let bytes = 0, arquivos = 0;
+  const st = fs.statSync(p);
+  if (!st.isDirectory()) return { bytes: st.size, arquivos: 1 };
+  for (const nome of fs.readdirSync(p)) {
+    const sub = tamanhoDe(path.join(p, nome));
+    bytes += sub.bytes;
+    arquivos += sub.arquivos;
+  }
+  return { bytes, arquivos };
+}
+
+app.get("/disco", (req, res) => {
+  const mb = (b) => Math.round((b / 1048576) * 10) / 10;
+  let itens = [];
+  try {
+    itens = fs.readdirSync(AUTH_DIR).map((nome) => {
+      const t = tamanhoDe(path.join(AUTH_DIR, nome));
+      const s = sessions.get(nome);
+      return { nome, mb: mb(t.bytes), arquivos: t.arquivos, sessao: s ? (s.isConnected ? "conectada" : "desconectada") : "-" };
+    });
+  } catch (err) {
+    return res.status(500).json({ error: err.message });
+  }
+  itens.sort((a, b) => b.mb - a.mb);
+  let volume = null;
+  try {
+    const f = fs.statfsSync(AUTH_DIR);
+    volume = { totalMb: mb(f.blocks * f.bsize), livreMb: mb(f.bavail * f.bsize) };
+  } catch {}
+  res.json({ volume, totalMb: mb(itens.reduce((s, i) => s + i.mb * 1048576, 0)), itens });
+});
+
+// Remove uma sessão DE VEZ: desliga, apaga credencial e config, e não recria.
+// O /reset não serve pra isso — ele sobe a sessão de novo na hora — e toda
+// pasta que sobra no Volume volta a cada restart (restoreSessions), presa num
+// ciclo de QR que ninguém vai escanear.
+//
+// POST, para nenhum navegador/prévia de link disparar por engano. E recusa
+// sessão CONECTADA: a remoção é para lixo, nunca para uma loja em uso; para
+// trocar o número de uma loja ativa o caminho continua sendo o /reset.
+app.post("/remover/:sessionId", (req, res) => {
+  const sessionId = sanitize(req.params.sessionId);
+  if (!sessionId) return res.status(400).json({ error: "Sessão inválida" });
+  const session = sessions.get(sessionId);
+  if (session?.isConnected) {
+    return res.status(409).json({ error: `"${sessionId}" está conectada — não removo sessão em uso` });
+  }
+  const authPath = path.join(AUTH_DIR, sessionId);
+  if (!session && !fs.existsSync(authPath) && !fs.existsSync(configPath(sessionId))) {
+    return res.status(404).json({ error: "Sessão não existe" });
+  }
+  // Sai do mapa ANTES de derrubar o socket: o timer de religação e o
+  // startSession em andamento conferem o mapa e desistem.
+  sessions.delete(sessionId);
+  if (session) {
+    try { session.sock?.ev?.removeAllListeners?.(); } catch {}
+    try { session.sock?.end?.(); } catch {}
+  }
+  for (const [k, v] of linksQR) if (v.sessionId === sessionId) linksQR.delete(k);
+  alertasEnviados.delete(sessionId);
+  try { fs.rmSync(authPath, { recursive: true, force: true }); } catch {}
+  try { fs.rmSync(configPath(sessionId), { force: true }); } catch {}
+  dbg(`[${sessionId}] REMOVIDA via /remover — credencial e config apagadas, não volta no restart`);
+  res.json({ ok: true, removida: sessionId });
 });
 
 // Reconexão NÃO-destrutiva: recria o socket com a MESMA credencial, sem QR e
