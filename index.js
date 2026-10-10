@@ -721,16 +721,29 @@ app.get("/reset/:sessionId", async (req, res) => {
 
 // Espaço do Volume por sessão. O Railway avisa "volume quase cheio" sem dizer
 // de quem é; sem isto a limpeza seria no chute.
+// `bytes` é o conteúdo; `ocupado` é o que o disco gasta de verdade (blocos).
+// A diferença importa aqui: o Baileys grava dezenas de milhares de arquivos de
+// poucos bytes, e cada um come um bloco inteiro. Em 10/10 eram 29 MB de
+// conteúdo ocupando ~300 MB do Volume.
 function tamanhoDe(p) {
-  let bytes = 0, arquivos = 0;
   const st = fs.statSync(p);
-  if (!st.isDirectory()) return { bytes: st.size, arquivos: 1 };
+  const ocupadoDe = (s) => (s.blocks != null ? s.blocks * 512 : s.size);
+  if (!st.isDirectory()) return { bytes: st.size, ocupado: ocupadoDe(st), arquivos: 1 };
+  let bytes = 0, ocupado = ocupadoDe(st), arquivos = 0;
   for (const nome of fs.readdirSync(p)) {
     const sub = tamanhoDe(path.join(p, nome));
     bytes += sub.bytes;
+    ocupado += sub.ocupado;
     arquivos += sub.arquivos;
   }
-  return { bytes, arquivos };
+  return { bytes, ocupado, arquivos };
+}
+
+// "session-5514...json" -> "session"; "creds.json" -> "creds". É o tipo que
+// decide o que pode ser apagado sem QR (ver resyncSession).
+const TIPOS_BAILEYS = /^(creds|pre-key|session|sender-key-memory|sender-key|app-state-sync-key|app-state-sync-version|lid-mapping|device-list|tctoken|identity-key)/;
+function tipoDoArquivo(nome) {
+  return nome.match(TIPOS_BAILEYS)?.[1] || nome.replace(/\.json$/, "").replace(/-.*$/, "");
 }
 
 app.get("/disco", (req, res) => {
@@ -738,20 +751,45 @@ app.get("/disco", (req, res) => {
   let itens = [];
   try {
     itens = fs.readdirSync(AUTH_DIR).map((nome) => {
-      const t = tamanhoDe(path.join(AUTH_DIR, nome));
+      const p = path.join(AUTH_DIR, nome);
+      const t = tamanhoDe(p);
       const s = sessions.get(nome);
-      return { nome, mb: mb(t.bytes), arquivos: t.arquivos, sessao: s ? (s.isConnected ? "conectada" : "desconectada") : "-" };
+      const item = {
+        nome,
+        mb: mb(t.bytes),
+        ocupadoMb: mb(t.ocupado),
+        arquivos: t.arquivos,
+        sessao: s ? (s.isConnected ? "conectada" : "desconectada") : "-",
+      };
+      if (fs.statSync(p).isDirectory()) {
+        const porTipo = {};
+        for (const f of fs.readdirSync(p)) {
+          const tt = tamanhoDe(path.join(p, f));
+          const k = tipoDoArquivo(f);
+          porTipo[k] = porTipo[k] || { arquivos: 0, ocupadoMb: 0 };
+          porTipo[k].arquivos += tt.arquivos;
+          porTipo[k].ocupadoMb += tt.ocupado / 1048576;
+        }
+        for (const v of Object.values(porTipo)) v.ocupadoMb = Math.round(v.ocupadoMb * 10) / 10;
+        item.porTipo = porTipo;
+      }
+      return item;
     });
   } catch (err) {
     return res.status(500).json({ error: err.message });
   }
-  itens.sort((a, b) => b.mb - a.mb);
+  itens.sort((a, b) => b.ocupadoMb - a.ocupadoMb);
   let volume = null;
   try {
     const f = fs.statfsSync(AUTH_DIR);
     volume = { totalMb: mb(f.blocks * f.bsize), livreMb: mb(f.bavail * f.bsize) };
   } catch {}
-  res.json({ volume, totalMb: mb(itens.reduce((s, i) => s + i.mb * 1048576, 0)), itens });
+  res.json({
+    volume,
+    totalMb: mb(itens.reduce((s, i) => s + i.mb * 1048576, 0)),
+    ocupadoMb: mb(itens.reduce((s, i) => s + i.ocupadoMb * 1048576, 0)),
+    itens,
+  });
 });
 
 // Remove uma sessão DE VEZ: desliga, apaga credencial e config, e não recria.
